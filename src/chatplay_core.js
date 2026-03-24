@@ -193,9 +193,8 @@ const CONFIG = {
     MAX_HISTORY_SIZE: 1000,
     SIMILARITY_THRESHOLD: 0.65,
     MAX_MESSAGES_TO_CAPTURE: 12,
-    SENHA_ADMIN: "1202",
-    KNOWLEDGE_BASE_COREN: "https://raw.githubusercontent.com/clebermitho/base-de-conhecimento/refs/heads/main/base_coren.json",
-    KNOWLEDGE_BASE_CHAT: "https://raw.githubusercontent.com/clebermitho/base-de-conhecimento/refs/heads/main/programa%C3%A7%C3%A3o%20ia.json",
+    KNOWLEDGE_BASE_COREN: "https://raw.githubusercontent.com/clebermitho/knowledge-base/main/base_coren.json",
+    KNOWLEDGE_BASE_CHAT: "https://raw.githubusercontent.com/clebermitho/knowledge-base/main/programa%C3%A7%C3%A3o%20ia.json",
     THEME: {
         primary: "#4f46e5",
         secondary: "#10b981",
@@ -896,15 +895,13 @@ async function gerarRespostasIA(contexto, pergunta) {
         if (CONFIG.BACKEND_URL && CONFIG.BACKEND_TOKEN) {
             console.log("[Chatplay Assistant] 🌐 Gerando sugestões via backend...");
             const categoria = classificarIntencao(pergunta);
-            const melhoresRespostas = getMelhoresRespostas(categoria, 3);
-            const padroesEvitar = AppState.sugestoesDesaprovadas?.padroes?.slice(0, 5).map(p => p.palavra) || [];
 
             const result = await BackendAPI.generateSuggestions({
                 context:       contexto,
                 question:      pergunta,
                 category:      categoria,
-                topExamples:   melhoresRespostas,
-                avoidPatterns: padroesEvitar,
+                topExamples:   [],
+                avoidPatterns: [],
             });
 
             const respostas = result.suggestions.map(s => s.text || s);
@@ -1333,6 +1330,12 @@ async function gerarSugestoesPainel() {
             return;
         }
 
+        const contexto = mensagens.map(m => {
+            return `${m.autor}:\n${m.texto}`;
+        }).join("\n\n") + `\n\nCLIENTE (MENSAGEM PRINCIPAL):\n${pergunta}`;
+
+        const categoria = classificarIntencao(pergunta);
+
         // Verifica histórico primeiro
         let encontrado = buscarNoHistorico(pergunta);
         let respostas;
@@ -1341,12 +1344,6 @@ async function gerarSugestoesPainel() {
             respostas = encontrado.item.respostas;
             console.log("[Chatplay Assistant] 📚 Usando respostas do histórico");
         } else {
-            let contexto = mensagens.map(m => {
-                return `${m.autor}:\n${m.texto}`;
-            }).join("\n\n");
-
-            contexto += `\n\nCLIENTE (MENSAGEM PRINCIPAL):\n${pergunta}`;
-
             respostas = await gerarRespostasIA(contexto, pergunta);
         }
 
@@ -1356,7 +1353,12 @@ async function gerarSugestoesPainel() {
             // Resetar seleção visual antes de adicionar novas sugestões
             sugestaoSelecionadaAtual = null;
 
-            adicionarMensagemAoChat("assistant", JSON.stringify(respostas), "sugestoes");
+            adicionarMensagemAoChat("assistant", JSON.stringify(respostas), "sugestoes", {
+                source: encontrado ? "history" : "fresh",
+                question: pergunta,
+                context: contexto,
+                category: categoria,
+            });
             AppState.ultimaPergunta = pergunta;
 
             // Salvar no histórico
@@ -1792,12 +1794,13 @@ const HistoryManager = {
    Migração futura: Transformar em componente React/Web Component na extensão
 ══════════════════════════════════════════════════════════════ */
 
-function adicionarMensagemAoChat(role, conteudo, tipo = "texto") {
+function adicionarMensagemAoChat(role, conteudo, tipo = "texto", meta = null) {
     let mensagem = {
         role: role,
         content: conteudo,
         tipo: tipo,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        meta: meta || undefined
     };
 
     AppState.chatMessages.push(mensagem);
@@ -2262,14 +2265,6 @@ function adicionarAnimacoesCSS() {
             box-shadow: 0 6px 20px rgba(79,106,245,.38);
             background: var(--cpa-bg-3);
         }
-        .cpa-fab-badge {
-            position:absolute; top:-4px; right:-4px;
-            background: var(--cpa-accent); color: var(--cpa-text-inv);
-            border-radius: var(--cpa-r-full);
-            font-size: 9px; font-weight: var(--cpa-fw-bold);
-            padding: 1px 5px; min-width:16px; text-align:center;
-            border: 1.5px solid var(--cpa-bg-1);
-        }
         .cpa-fab-tooltip {
             position:absolute; right:56px;
             background: var(--cpa-bg-3);
@@ -2660,7 +2655,7 @@ function getCorCategoria(cat, bg = false) {
     return bg ? t.b : t.c;
 }
 
-function renderizarMensagemNoChat(role, conteudo, tipo = "texto") {
+function renderizarMensagemNoChat(role, conteudo, tipo = "texto", meta = undefined) {
     const container = document.getElementById("chat-messages-container");
     if (!container) return;
 
@@ -2677,6 +2672,13 @@ function renderizarMensagemNoChat(role, conteudo, tipo = "texto") {
             <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
             Sugestões de resposta
         </div>`;
+
+        if (meta?.source === "history") {
+            const info = document.createElement("div");
+            info.style.cssText = "margin:6px 0 10px;font-size:var(--cpa-text-xs);color:var(--cpa-text-2)";
+            info.textContent = "Estas sugestões foram reutilizadas do histórico.";
+            wrap.appendChild(info);
+        }
 
         sugestoes.forEach((sug, i) => {
             const row = document.createElement("div");
@@ -2765,6 +2767,44 @@ function renderizarMensagemNoChat(role, conteudo, tipo = "texto") {
             wrap.appendChild(row);
         });
 
+        if (meta?.source === "history") {
+            const regen = document.createElement("button");
+            regen.className = "cpa-btn cpa-btn--ghost cpa-btn--full";
+            regen.style.marginTop = "10px";
+            regen.textContent = "Gerar novas sugestões";
+
+            regen.onclick = async () => {
+                if (!meta?.context || !meta?.question) return;
+                regen.disabled = true;
+                regen.style.opacity = ".6";
+                regen.textContent = "Gerando...";
+                try {
+                    const novas = await gerarRespostasIA(meta.context, meta.question);
+                    if (novas && novas.length > 0) {
+                        AppState.ultimaPergunta = meta.question;
+                        adicionarMensagemAoChat("assistant", JSON.stringify(novas), "sugestoes", {
+                            source: "fresh",
+                            question: meta.question,
+                            context: meta.context,
+                            category: meta.category,
+                        });
+                        salvarNoHistorico(meta.question, novas, meta.context);
+                    } else {
+                        mostrarNotificacao("❌ Falha ao gerar novas sugestões", "erro");
+                    }
+                } catch (err) {
+                    console.error("[Chatplay Assistant] ❌ Erro:", err);
+                    mostrarNotificacao("❌ Erro ao gerar novas sugestões", "erro");
+                } finally {
+                    regen.disabled = false;
+                    regen.style.opacity = "1";
+                    regen.textContent = "Gerar novas sugestões";
+                }
+            };
+
+            wrap.appendChild(regen);
+        }
+
         msgDiv.appendChild(wrap);
     } else {
         const bubble = document.createElement("div");
@@ -2780,7 +2820,7 @@ function renderizarTodasMensagens() {
     const container = document.getElementById("chat-messages-container");
     if (!container) return;
     container.innerHTML = "";
-    AppState.chatMessages.forEach(msg => renderizarMensagemNoChat(msg.role, msg.content, msg.tipo));
+    AppState.chatMessages.forEach(msg => renderizarMensagemNoChat(msg.role, msg.content, msg.tipo, msg.meta));
     container.scrollTop = container.scrollHeight;
 }
 
@@ -2848,15 +2888,6 @@ function criarBotaoAcao(texto, tipo, onClick) {
     return btn;
 }
 
-function criarBotaoLimpeza(texto, tipo, onClick) {
-    const map = { danger:"cpa-btn--danger", warning:"cpa-btn--ghost" };
-    const btn = document.createElement("button");
-    btn.className = `cpa-btn ${map[tipo] || "cpa-btn--ghost"} cpa-btn--full cpa-clean-btn`;
-    btn.textContent = texto;
-    btn.onclick = onClick;
-    return btn;
-}
-
 function criarBotaoPrincipal() {
     document.getElementById("ai-botao-principal")?.remove();
 
@@ -2873,13 +2904,6 @@ function criarBotaoPrincipal() {
         </svg>
         <span class="cpa-fab-tooltip">Abrir Assistente (ALT+1)</span>
     `;
-
-    if (AppState.chatMessages.length > 0) {
-        const badge = document.createElement("span");
-        badge.className = "cpa-fab-badge";
-        badge.textContent = AppState.chatMessages.length > 99 ? "99+" : AppState.chatMessages.length;
-        fab.appendChild(badge);
-    }
 
     fab.onclick = () => { container.remove(); criarPainelFixo(); };
     container.appendChild(fab);
@@ -3037,75 +3061,7 @@ function criarPainelFixo() {
     renderizarTodasMensagens();
 }
 
-function mostrarOpcoesLimpeza() {
-    const backdrop = document.createElement("div");
-    backdrop.className = "cpa-modal-backdrop cpa-root";
-
-    const modal = document.createElement("div");
-    modal.className = "cpa-modal-simple cpa-root";
-
-    modal.innerHTML = `
-        <div class="cpa-modal-simple-title">Gerenciar dados</div>
-        <div class="cpa-modal-simple-desc">Informe a senha de administrador para acessar as opções de limpeza.</div>
-        <input type="password" id="cpa-clean-pwd" class="cpa-input" placeholder="Senha" autocomplete="off" style="margin-bottom:var(--cpa-sp-3)">
-        <div class="cpa-btn-row" style="margin-bottom:var(--cpa-sp-4)">
-            <button class="cpa-btn cpa-btn--primary" id="cpa-btn-verify" style="flex:1">Verificar</button>
-            <button class="cpa-btn cpa-btn--ghost" id="cpa-btn-cancel-clean" style="flex:1">Cancelar</button>
-        </div>
-        <div id="cpa-clean-options" style="display:none;border-top:1px solid var(--cpa-border);padding-top:var(--cpa-sp-4)"></div>
-    `;
-
-    document.body.appendChild(backdrop);
-    document.body.appendChild(modal);
-
-    const input = modal.querySelector("#cpa-clean-pwd");
-    const optsDiv = modal.querySelector("#cpa-clean-options");
-
-    modal.querySelector("#cpa-btn-cancel-clean").onclick = () => { backdrop.remove(); modal.remove(); };
-    backdrop.onclick = () => { backdrop.remove(); modal.remove(); };
-
-    modal.querySelector("#cpa-btn-verify").onclick = () => {
-        if (input.value !== CONFIG.SENHA_ADMIN) {
-            input.classList.add("cpa-input--error");
-            mostrarNotificacao("Senha incorreta.", "erro");
-            setTimeout(() => input.classList.remove("cpa-input--error"), 1800);
-            input.value = "";
-            return;
-        }
-        optsDiv.style.display = "block";
-        input.disabled = true;
-        modal.querySelector("#cpa-btn-verify").disabled = true;
-        modal.querySelector("#cpa-btn-verify").style.opacity = ".5";
-        mostrarNotificacao("Acesso liberado.", "sucesso");
-    };
-
-    const ops = [
-        ["Limpar log de sugestões", "warning", () => { AppState.logSugestoes = {}; storageSet(STORAGE_KEYS.LOG_SUGESTOES, {}); mostrarNotificacao("Log limpo."); }],
-        ["Limpar respostas desaprovadas", "warning", () => { AppState.sugestoesDesaprovadas = { respostas:[], padroes:[], categorias:{} }; AppState.estatisticas.totalDesaprovadas = 0; storageSet(STORAGE_KEYS.DESAPROVADAS, AppState.sugestoesDesaprovadas); storageSet(STORAGE_KEYS.STATS, AppState.estatisticas); mostrarNotificacao("Desaprovadas limpas."); }],
-        ["Limpar histórico", "warning", () => { AppState.historico = []; storageSet(STORAGE_KEYS.HISTORICO, []); mostrarNotificacao("Histórico limpo."); }],
-        ["Limpar templates", "warning", () => { AppState.templates = { NEGOCIACAO:[], SUSPENSAO:[], CANCELAMENTO:[], DUVIDA:[], RECLAMACAO:[], OUTROS:[] }; storageSet(STORAGE_KEYS.TEMPLATES, AppState.templates); mostrarNotificacao("Templates limpos."); }],
-        ["Limpar scores", "warning", () => { AppState.scoresRespostas = {}; storageSet(STORAGE_KEYS.SCORES, {}); mostrarNotificacao("Scores limpos."); }],
-        ["Limpar chat", "warning", () => { AppState.chatMessages = []; storageSet(STORAGE_KEYS.CHAT_MSGS, []); mostrarNotificacao("Chat limpo."); }],
-        ["Limpar estatísticas", "warning", () => { AppState.estatisticas = garantirEstruturaEstatisticas(null); storageSet(STORAGE_KEYS.STATS, AppState.estatisticas); mostrarNotificacao("Estatísticas zeradas."); }],
-        ["Limpar tudo", "danger", () => {
-            if (!confirm("Apagar TODOS os dados do assistente?")) return;
-            AppState.historico = []; AppState.logSugestoes = {}; AppState.sugestoesDesaprovadas = { respostas:[], padroes:[], categorias:{} };
-            AppState.templates = { NEGOCIACAO:[], SUSPENSAO:[], CANCELAMENTO:[], DUVIDA:[], RECLAMACAO:[], OUTROS:[] };
-            AppState.scoresRespostas = {}; AppState.chatMessages = []; AppState.estatisticas = garantirEstruturaEstatisticas(null);
-            storageSet(STORAGE_KEYS.HISTORICO, []); storageSet(STORAGE_KEYS.LOG_SUGESTOES, {}); storageSet(STORAGE_KEYS.DESAPROVADAS, { respostas:[], padroes:[], categorias:{} });
-            storageSet(STORAGE_KEYS.TEMPLATES, AppState.templates); storageSet(STORAGE_KEYS.SCORES, {}); storageSet(STORAGE_KEYS.CHAT_MSGS, []); storageSet(STORAGE_KEYS.STATS, AppState.estatisticas);
-            if (typeof GM_deleteValue !== "undefined") { try { GM_deleteValue("cache_respostas_v7"); } catch(e) {} }
-            if (typeof GM_deleteValue !== "undefined") { try { GM_deleteValue("historico_respostas_v7"); } catch(e) {} }
-            mostrarNotificacao("Todos os dados apagados.", "sucesso");
-        }]
-    ];
-    ops.forEach(([label, tipo, cb]) => {
-        const btn = criarBotaoLimpeza(label, tipo, cb);
-        optsDiv.appendChild(btn);
-    });
-
-    setTimeout(() => input.focus(), 80);
-}
+function mostrarOpcoesLimpeza() { return; }
 
 
 function criarPainelProfissional() {
@@ -3388,11 +3344,6 @@ function criarPainelProfissional() {
             const card = document.createElement("div");
             card.className = "cpa-discard-card";
 
-            const delBtn = document.createElement("button");
-            delBtn.className = "cpa-delete-btn";
-            delBtn.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg>`;
-            delBtn.onclick = (e) => { e.stopPropagation(); if (confirm("Excluir?")) { excluirRespostaDesaprovada(item.id); card.remove(); } };
-
             const dh = document.createElement("div");
             dh.style.cssText = "display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--cpa-sp-2);padding-right:28px";
             const dBadge = document.createElement("span");
@@ -3413,7 +3364,7 @@ function criarPainelProfissional() {
             dr.style.cssText = "font-size:var(--cpa-text-sm);color:var(--cpa-text-1);padding:var(--cpa-sp-2) var(--cpa-sp-3);background:var(--cpa-bg-1);border-radius:var(--cpa-r-md)";
             dr.textContent = item.resposta;
 
-            card.appendChild(delBtn); card.appendChild(dh); card.appendChild(dq); card.appendChild(dr);
+            card.appendChild(dh); card.appendChild(dq); card.appendChild(dr);
             secDesap.appendChild(card);
         });
     }
@@ -3446,9 +3397,6 @@ function criarPainelProfissional() {
 
     const prefs = [
         ["Notificações", "notificacoes"],
-        ["Sugestões automáticas", "autoSugestao"],
-        ["Evitar respostas desaprovadas", "evitarDesaprovadas"],
-        ["Usar templates aprendidos", "usarTemplates"]
     ];
 
     prefs.forEach(([label, key]) => {
@@ -3467,15 +3415,6 @@ function criarPainelProfissional() {
         secPref.appendChild(row);
     });
 
-    const secClean = document.createElement("div");
-    secClean.className = "cpa-section";
-    secClean.innerHTML = `<div class="cpa-section-title">Gerenciar dados</div>`;
-    const btnLimpar = document.createElement("button");
-    btnLimpar.className = "cpa-btn cpa-btn--danger cpa-btn--full";
-    btnLimpar.textContent = "Acessar opções de limpeza";
-    btnLimpar.onclick = () => mostrarOpcoesLimpeza();
-    secClean.appendChild(btnLimpar);
-
     const btnSaveConfig = document.createElement("button");
     btnSaveConfig.className = "cpa-btn cpa-btn--primary cpa-btn--full";
     btnSaveConfig.textContent = "Salvar configurações";
@@ -3489,7 +3428,6 @@ function criarPainelProfissional() {
 
     tabConfig.appendChild(secApi);
     tabConfig.appendChild(secPref);
-    tabConfig.appendChild(secClean);
     tabConfig.appendChild(btnSaveConfig);
     content.appendChild(tabConfig);
 
@@ -3566,25 +3504,6 @@ function criarPainelProfissional() {
 
     painel.appendChild(content);
 
-    /* FOOTER */
-    const footer = document.createElement("div");
-    footer.className = "cpa-modal-footer";
-
-    const btnExport = criarBotaoAcao("Exportar backup", "secondary", () => {
-        const blob = new Blob(
-            [JSON.stringify({ historico: AppState.historico, logSugestoes: AppState.logSugestoes, templates: AppState.templates, desaprovadas: AppState.sugestoesDesaprovadas, estatisticas: AppState.estatisticas, scores: AppState.scoresRespostas, chatMessages: AppState.chatMessages }, null, 2)],
-            { type:"application/json" }
-        );
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url; a.download = `chatplay_backup_${new Date().toISOString().slice(0,10)}.json`;
-        a.click();
-        mostrarNotificacao("Backup exportado.");
-    });
-
-    footer.appendChild(btnExport);
-    painel.appendChild(footer);
-
     document.body.appendChild(backdrop);
     document.body.appendChild(painel);
 
@@ -3602,10 +3521,8 @@ const UI = {
     removerDigitacao,
     mostrarNotificacao,
     criarBotaoAcao,
-    criarBotaoLimpeza,
     criarBotaoPrincipal,
     criarPainelFixo,
-    mostrarOpcoesLimpeza,
     criarPainelProfissional,
 };
 
@@ -3724,6 +3641,8 @@ async function _sincronizarSettingsBackend() {
             const s = settings.settings;
 
             // ── Aprendizado / qualidade ──────────────────────────────────
+            if (s['suggestion.autoSuggest']         !== undefined)
+                AppState.preferencias.autoSugestao = Boolean(s['suggestion.autoSuggest']);
             if (s['suggestion.filterRejected']       !== undefined)
                 AppState.preferencias.evitarDesaprovadas = Boolean(s['suggestion.filterRejected']);
             if (s['suggestion.learnFromApproved']    !== undefined)
