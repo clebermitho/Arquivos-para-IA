@@ -146,11 +146,11 @@ const BackendAPI = {
         });
     },
 
-    /** Chat IA via backend — envia contexto, bases JSON e system prompt */
-    async chatReply({ message, history = [], context = "", knowledge = null, systemPrompt = "" }) {
+    /** Chat IA via backend */
+    async chatReply({ message, history = [], context = "" }) {
         return this.request('/api/ai/chat', {
             method: 'POST',
-            body: JSON.stringify({ message, history, context, knowledge, systemPrompt }),
+            body: JSON.stringify({ message, history, context }),
         });
     },
 
@@ -1114,89 +1114,10 @@ async function gerarRespostaChat(mensagem, baseConhecimento) {
                 ? mensagensCapturadas.map(m => `${m.autor}: ${m.texto}`).join("\n")
                 : "";
 
-            // ── Bases de conhecimento ──
-            const baseCoren = await carregarConhecimentoCoren();
-            const baseChat  = await carregarConhecimentoChat();
-
-            // ── Histórico do chat (formato texto para o prompt) ──
-            const historicoChat = AppState.chatMessages
-                .slice(-10)
-                .map(msg => `${msg.role === "user" ? "Operador" : "Assistente"}: ${msg.content || msg.texto || ""}`)
-                .join("\n");
-
-            // ── System Prompt completo ──
-            const systemPrompt = `Você é um assistente inteligente que ajuda um operador humano.
-
-IMPORTANTE:
-- Você está conversando com o OPERADOR (não com o profissional).
-- Responda de forma natural, como uma IA normal (tipo ChatGPT).
-- NÃO assuma automaticamente que toda mensagem envolve atendimento.
-
-CONTEXTO DO SISTEMA (use apenas quando relevante):
-BASE COREN:
-${JSON.stringify(baseConhecimento || baseCoren, null, 2)}
-
-HISTÓRICO:
-${historicoChat}
-
-MENSAGEM:
-${mensagem}
-
-REGRA PRINCIPAL:
-Antes de responder, identifique o tipo da pergunta:
-
-1. Se for dúvida geral, técnica ou conversa normal:
-→ Responda normalmente, de forma clara e direta.
-
-2. Se for sobre atendimento, cliente, cobrança, ou como responder alguém:
-→ Ative o modo estratégico e responda neste formato (quando possível), se necessário poderá alterar o formato:
-
-[MENSAGEM PRONTA]
-
-[Frase de validação empática]
-[Explicação técnica de forma simples]
-[Oferta de solução, passo a passo ou próximo passo]
-
-Livre para modificar estrutura quando necessário
-(chamar de profissional mas evitar fazer isso em 100% das respostas)
-
-🎯 Por que essa resposta funciona:
-- [ponto 1]
-- [ponto 2]
-- [ponto 3]
-
-IMPORTANTE:
-- Use emojis adequados: 🤝, 👍, ✅, ⚠️, etc.
-- Use quebras de linha para deixar visualmente agradável
-- Mantenha tom humano e acolhedor
-- Não invente contexto de cliente se não existir
-- Não force respostas estratégicas sem necessidade
-- Seja natural, direto e útil
-- Se a pergunta for ambígua, peça esclarecimento antes de assumir contexto
-- Se a pergunta for sobre cancelamento/suspensão/Certidão única/certificado/comprovante de quitação/Nada consta/Solicitar Nova carteirinha/Renovar carteirinha, ou algo parecido: encaminhe o passo a passo com o link correto para que o cliente consiga efetuar o procedimento, avisando que qualquer dúvida o cliente deve entrar em contato com a central.
-- Formule a resposta da melhor forma para o profissional.
-
-REGRA CRÍTICA DE NEGOCIAÇÃO (OBRIGATÓRIO):
-- Nunca confirme valores específicos de parcelas, entrada ou condições solicitadas pelo profissional.
-- Não valide valores como R$ 100,00, R$ 50,00 ou qualquer quantia sugerida pelo profissional.
-- Não monte propostas personalizadas com valores.
-- Sempre informe que será necessário verificar no sistema quais condições estão disponíveis.
-- Utilize frases como:
-  "Posso verificar no sistema se há alguma condição mais acessível para você"
-  "Vou consultar as possibilidades disponíveis para encontrar a melhor alternativa"
-  "As condições seguem critérios do sistema, mas posso verificar uma opção mais viável para você"
-- Nunca diga que pode alterar valores manualmente.
-- Nunca simule negociação fora das regras do sistema.`;
-
             const result = await BackendAPI.chatReply({
                 message: mensagem,
                 history,
                 context: contexto,
-                knowledge: {
-                    coren:   baseCoren,
-                    sistema: baseChat,
-                },
-                systemPrompt,
             });
             return result.reply;
         }
