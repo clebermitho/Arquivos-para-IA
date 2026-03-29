@@ -1,0 +1,56 @@
+name: CI/CD Extension
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate manifest.json
+        run: |
+          echo "Validating manifest.json..."
+          node -e "
+            const manifest = require('./manifest.json');
+            const required = ['manifest_version', 'name', 'version', 'permissions', 'background', 'content_scripts', 'action', 'icons'];
+            const missing = required.filter(k => !manifest[k]);
+            if (missing.length) { console.error('Missing keys:', missing); process.exit(1); }
+            if (manifest.manifest_version !== 3) { console.error('Must be Manifest V3'); process.exit(1); }
+            console.log('✅ manifest.json is valid');
+            console.log('  Name:', manifest.name);
+            console.log('  Version:', manifest.version);
+          "
+
+      - name: Check JavaScript syntax
+        run: |
+          echo "Checking JS syntax..."
+          for file in src/*.js popup.js; do
+            if [ -f "$file" ]; then
+              node --check "$file" && echo "✅ $file" || exit 1
+            fi
+          done
+
+      - name: Verify required files exist
+        run: |
+          echo "Checking required files..."
+          files=("manifest.json" "popup.html" "popup.js" "src/background.js" "src/content_script.js" "src/chatplay_core.js" "src/storage_adapter.js")
+          for f in "${files[@]}"; do
+            if [ ! -f "$f" ]; then echo "❌ Missing: $f"; exit 1; fi
+            echo "✅ $f"
+          done
+
+      - name: Verify icons exist
+        run: |
+          for size in 16 32 48 128; do
+            if [ ! -f "icons/icon${size}.png" ]; then echo "❌ Missing: icons/icon${size}.png"; exit 1; fi
+            echo "✅ icons/icon${size}.png"
+          done
