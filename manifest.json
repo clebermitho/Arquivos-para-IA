@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Chatplay Assistant",
+  "name": "AssistentePlay",
   "version": "9.2.0",
-  "description": "Assistente inteligente para o painel Chatplay — sugestões contextuais via backend centralizado.",
+  "description": "Assistente inteligente para o painel AssistentePlay — sugestões contextuais via backend centralizado.",
   "default_locale": "pt_BR",
 
   "permissions": [
@@ -45,7 +45,7 @@
       "48":  "icons/icon48.png",
       "128": "icons/icon128.png"
     },
-    "default_title": "Chatplay Assistant"
+    "default_title": "AssistentePlay"
   },
 
   "icons": {

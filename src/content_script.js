@@ -1,8 +1,8 @@
 /**
- * content_script.js — Chatplay Assistant v9.2.0
+ * content_script.js — AssistentePlay v9.2.0
  *
  * Fluxo:
- *   1. MutationObserver aguarda o painel Chatplay estar presente no DOM.
+ *   1. MutationObserver aguarda o painel AssistentePlay estar presente no DOM.
  *   2. Quando detectado (ou timeout), importa chatplay_core.js e chama inicializar().
  *   3. Listener chrome.runtime.onMessage:
  *      - STATE_UPDATED   → core já trata via onChanged
@@ -50,7 +50,7 @@ async function loadCore() {
         _coreModule = await import(chrome.runtime.getURL('src/chatplay_core.js'));
         console.log('[ChatplayExt] ✅ Core carregado. Chamando inicializar()...');
         await _coreModule.inicializar();
-        console.log('[ChatplayExt] 🚀 Chatplay Assistant v9.2.0 ativo!');
+        console.log('[ChatplayExt] 🚀 AssistentePlay v9.2.0 ativo!');
     } catch (err) {
         console.error('[ChatplayExt] ❌ Erro ao carregar chatplay_core.js:', err);
         _coreLoaded = false; // permite retry

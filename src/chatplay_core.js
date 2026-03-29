@@ -1,5 +1,5 @@
 /**
- * chatplay_core.js — Módulo principal da extensão Chatplay Assistant
+ * chatplay_core.js — Módulo principal da extensão AssistentePlay
  * @version 9.2.0
  *
  * Derivado de: Chatplay_Assistant_v9.1.0.user.js
@@ -2850,8 +2850,7 @@ function criarPainelFixo() {
                 <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
             </svg>
         </div>
-        <span class="cpa-panel-brand-name">Chatplay
-            <span class="cpa-panel-brand-version">v8</span>
+        <span class="cpa-panel-brand-name">AssistentePlay
         </span>
     `;
 
@@ -3004,8 +3003,7 @@ function criarPainelProfissional() {
     header.innerHTML = `
         <div class="cpa-modal-title">
             <div class="cpa-modal-title-dot"></div>
-            Chatplay Assistant
-            <span style="font-size:var(--cpa-text-xs);color:var(--cpa-text-3);font-weight:400;margin-left:4px">v8.0.0</span>
+            AssistentePlay
         </div>
     `;
     const btnClose = document.createElement("button");
