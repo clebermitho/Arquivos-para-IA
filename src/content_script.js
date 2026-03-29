@@ -44,15 +44,15 @@ async function loadCore() {
     if (_coreLoaded) return;
     _coreLoaded = true;
 
-    console.log('[ChatplayExt] ⚡ DOM pronto. Carregando chatplay_core.js...');
+    console.log('[AssistentePlayExt] ⚡ DOM pronto. Carregando chatplay_core.js...');
 
     try {
         _coreModule = await import(chrome.runtime.getURL('src/chatplay_core.js'));
-        console.log('[ChatplayExt] ✅ Core carregado. Chamando inicializar()...');
+        console.log('[AssistentePlayExt] ✅ Core carregado. Chamando inicializar()...');
         await _coreModule.inicializar();
-        console.log('[ChatplayExt] 🚀 AssistentePlay v9.2.0 ativo!');
+        console.log('[AssistentePlayExt] 🚀 AssistentePlay v9.2.0 ativo!');
     } catch (err) {
-        console.error('[ChatplayExt] ❌ Erro ao carregar chatplay_core.js:', err);
+        console.error('[AssistentePlayExt] ❌ Erro ao carregar chatplay_core.js:', err);
         _coreLoaded = false; // permite retry
     }
 }
@@ -81,7 +81,7 @@ function bootstrap() {
     setTimeout(() => {
         if (!_coreLoaded) {
             observer.disconnect();
-            console.warn('[ChatplayExt] ⏱ Timeout — carregando core sem seletor confirmado.');
+            console.warn('[AssistentePlayExt] ⏱ Timeout — carregando core sem seletor confirmado.');
             loadCore();
         }
     }, MAX_WAIT_MS);
@@ -101,7 +101,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             const btn = document.querySelector('[data-chatplay-toggle]')
                      || document.getElementById('ai-botao-principal');
             if (btn) btn.click();
-            else console.warn('[ChatplayExt] Botão principal não encontrado.');
+            else console.warn('[AssistentePlayExt] Botão principal não encontrado.');
             sendResponse({ ok: true });
             break;
         }
@@ -111,7 +111,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             const { token } = message.payload || {};
             if (token && _coreModule?.setAuthToken) {
                 _coreModule.setAuthToken(token);
-                console.log('[ChatplayExt] 🔑 Token de autenticação atualizado no core.');
+                console.log('[AssistentePlayExt] 🔑 Token de autenticação atualizado no core.');
             }
             sendResponse({ ok: true });
             break;
@@ -121,7 +121,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         case 'AUTH_CLEARED': {
             if (_coreModule?.setAuthToken) {
                 _coreModule.setAuthToken(null);
-                console.log('[ChatplayExt] 🔒 Token de autenticação removido do core.');
+                console.log('[AssistentePlayExt] 🔒 Token de autenticação removido do core.');
             }
             sendResponse({ ok: true });
             break;
@@ -132,7 +132,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             const { backendUrl } = message.payload || {};
             if (backendUrl && _coreModule?.setBackendUrl) {
                 _coreModule.setBackendUrl(backendUrl);
-                console.log('[ChatplayExt] ⚙️ BACKEND_URL atualizado:', backendUrl);
+                console.log('[AssistentePlayExt] ⚙️ BACKEND_URL atualizado:', backendUrl);
             }
             sendResponse({ ok: true });
             break;
