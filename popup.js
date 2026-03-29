@@ -1,5 +1,5 @@
 /**
- * popup.js — Chatplay Assistant v9.2.0
+ * popup.js — AssistentePlay v9.2.0
  *
  * Fluxo:
  *   1. Carrega BACKEND_URL e BACKEND_TOKEN do chrome.storage
@@ -133,23 +133,15 @@ async function loadStats() {
 }
 
 // ── Exibição do usuário logado ───────────────────────────────
-function renderUser(user, expiresAt) {
+function renderUser(user) {
     // Avatar: iniciais do nome
     const initials = (user.name || '?').split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase();
     $('user-avatar').textContent = initials;
     $('user-name').textContent   = user.name || user.email;
     $('user-role').textContent   = user.role || 'AGENT';
 
-    // Expiração da sessão
-    if (expiresAt) {
-        const exp  = new Date(expiresAt);
-        const diff = exp - Date.now();
-        const hrs  = Math.max(0, Math.floor(diff / 3600000));
-        const min  = Math.max(0, Math.floor((diff % 3600000) / 60000));
-        $('stat-session').textContent = hrs > 0 ? `${hrs}h ${min}m` : `${min}min`;
-    } else {
-        $('stat-session').textContent = '—';
-    }
+    // Sessão ativa
+    $('stat-session').textContent = 'Ativa';
 }
 
 // ── Persistência do token ────────────────────────────────────
@@ -209,6 +201,8 @@ async function init() {
     if (!state.token) {
         setStatus('Não autenticado', 'red');
         setBadge('offline');
+        chrome.action.setBadgeText({ text: '!' });
+        chrome.action.setBadgeBackgroundColor({ color: '#ef4444' });
         showView('login');
         return;
     }
@@ -234,7 +228,8 @@ async function init() {
         }
         setStatus(`Conectado — ${state.backendUrl.replace('https://', '').replace('http://', '')}`, 'green');
         setBadge('backend');
-        renderUser(state.user, state.sessionExp);
+        chrome.action.setBadgeText({ text: '' });
+        renderUser(state.user);
         await loadStats();
         showView('dashboard');
     } catch (err) {
@@ -252,7 +247,7 @@ async function init() {
             $('user-avatar').textContent = '?';
             $('user-name').textContent   = storedName;
             $('user-role').textContent   = 'sem conexão';
-            $('stat-session').textContent = '—';
+            $('stat-session').textContent = 'Ativa';
             await loadStats();
             showView('dashboard');
         }
@@ -284,7 +279,8 @@ $('btn-login').addEventListener('click', async () => {
         await saveAuth(res.token, res.expiresAt, res.refreshToken);
         setStatus(`Conectado — ${state.backendUrl.replace('http://', '')}`, 'green');
         setBadge('backend');
-        renderUser(state.user, res.expiresAt);
+        chrome.action.setBadgeText({ text: '' });
+        renderUser(state.user);
         await loadStats();
         showView('dashboard');
     } catch (err) {
@@ -308,6 +304,8 @@ $('btn-logout').addEventListener('click', async () => {
     await clearAuth();
     setStatus('Sessão encerrada', 'red');
     setBadge('offline');
+    chrome.action.setBadgeText({ text: '!' });
+    chrome.action.setBadgeBackgroundColor({ color: '#ef4444' });
     $('input-email').value    = '';
     $('input-password').value = '';
     showView('login');
@@ -316,6 +314,8 @@ $('btn-logout').addEventListener('click', async () => {
 // Relogin (sessão expirada)
 $('btn-relogin').addEventListener('click', () => {
     setStatus('Faça login novamente', 'amber');
+    chrome.action.setBadgeText({ text: '!' });
+    chrome.action.setBadgeBackgroundColor({ color: '#ef4444' });
     showView('login');
 });
 

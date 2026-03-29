@@ -1,10 +1,11 @@
 /**
- * background.js — Chatplay Assistant Service Worker v9.2.0
+ * background.js — AssistentePlay Service Worker v9.2.0
  *
  * Responsabilidades:
  *   - Proxy de chamadas ao backend autenticado (sem CORS no content_script)
  *   - Relay de mensagens de autenticação entre popup e content_script
  *   - Broadcast de atualizações de estado para todas as abas ativas
+ *   - Heartbeat periódico ao backend para manter sessão ativa
  *
  * NOTA MV3: Service Workers são efêmeros — nenhum estado em memória
  * entre invocações. Todo estado persistente usa chrome.storage.local.
@@ -21,13 +22,63 @@ const STORAGE_KEYS = {
 
 const DEFAULT_BACKEND_URL = 'https://backend-assistant-0x1d.onrender.com';
 
+// ── Heartbeat: envia ping periódico ao backend ────────────────
+const HEARTBEAT_ALARM_NAME = 'chatplay_heartbeat';
+const HEARTBEAT_INTERVAL_MIN = 5;
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+    if (alarm.name === HEARTBEAT_ALARM_NAME) {
+        await sendHeartbeat();
+    }
+});
+
+async function sendHeartbeat() {
+    try {
+        const stored = await chrome.storage.local.get([
+            STORAGE_KEYS.BACKEND_TOKEN,
+            STORAGE_KEYS.BACKEND_URL,
+        ]);
+        const token = stored[STORAGE_KEYS.BACKEND_TOKEN];
+        if (!token) return; // Não autenticado
+
+        const baseUrl = stored[STORAGE_KEYS.BACKEND_URL] || DEFAULT_BACKEND_URL;
+        await fetch(`${baseUrl}/api/auth/heartbeat`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`,
+            },
+        });
+    } catch (err) {
+        // Falha silenciosa — heartbeat é best-effort
+        console.warn('[AssistentePlayBG] Heartbeat falhou:', err.message);
+    }
+}
+
+async function startHeartbeat() {
+    await chrome.alarms.create(HEARTBEAT_ALARM_NAME, {
+        periodInMinutes: HEARTBEAT_INTERVAL_MIN,
+    });
+    // Enviar heartbeat imediato
+    await sendHeartbeat();
+}
+
+async function stopHeartbeat() {
+    await chrome.alarms.clear(HEARTBEAT_ALARM_NAME);
+}
+
 // ── Instalação / atualização ──────────────────────────────────
-chrome.runtime.onInstalled.addListener(({ reason }) => {
+chrome.runtime.onInstalled.addListener(async ({ reason }) => {
     const msgs = {
-        install: '🚀 Chatplay Assistant v9.2.0 instalado.',
-        update:  '✅ Chatplay Assistant atualizado para v9.2.0.',
+        install: '🚀 AssistentePlay v9.2.0 instalado.',
+        update:  '✅ AssistentePlay atualizado para v9.2.0.',
     };
-    if (msgs[reason]) console.log('[ChatplayBG]', msgs[reason]);
+    if (msgs[reason]) console.log('[AssistentePlayBG]', msgs[reason]);
+    // Iniciar heartbeat se já autenticado
+    const stored = await chrome.storage.local.get([STORAGE_KEYS.BACKEND_TOKEN]);
+    if (stored[STORAGE_KEYS.BACKEND_TOKEN]) {
+        await startHeartbeat();
+    }
 });
 
 // ── Listener de mensagens ─────────────────────────────────────
@@ -52,15 +103,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         // ── Auth: popup persistiu novo token → notifica tabs ─
         case 'AUTH_UPDATED':
-            broadcastToAllTabs({ type: 'AUTH_UPDATED', payload });
-            sendResponse({ ok: true });
-            break;
+            (async () => {
+                broadcastToAllTabs({ type: 'AUTH_UPDATED', payload });
+                await startHeartbeat();
+                sendResponse({ ok: true });
+            })();
+            return true;
 
         // ── Auth: sessão encerrada → notifica tabs ────────────
         case 'AUTH_CLEARED':
-            broadcastToAllTabs({ type: 'AUTH_CLEARED' });
-            sendResponse({ ok: true });
-            break;
+            (async () => {
+                broadcastToAllTabs({ type: 'AUTH_CLEARED' });
+                await stopHeartbeat();
+                sendResponse({ ok: true });
+            })();
+            return true;
 
         // ── Config atualizada (ex: nova BACKEND_URL) ──────────
         case 'CONFIG_UPDATED':
@@ -136,7 +193,7 @@ async function handleBackendRequest({ path, method = 'GET', body = null }) {
                 res = await doFetch(token);
             }
         } catch (refreshErr) {
-            console.warn('[ChatplayBG] Refresh falhou:', refreshErr.message);
+            console.warn('[AssistentePlayBG] Refresh falhou:', refreshErr.message);
         }
     }
 
@@ -157,7 +214,7 @@ async function handleBackendRequest({ path, method = 'GET', body = null }) {
  * Em produção, toda IA passa pelo backend.
  */
 async function handleOpenAIRequest({ apiKey, messages, model = 'gpt-4o-mini', max_tokens = 500, temperature = 0.7 }) {
-    console.warn('[ChatplayBG] ⚠️ Usando proxy OpenAI legado. Configure o backend para produção.');
+    console.warn('[AssistentePlayBG] ⚠️ Usando proxy OpenAI legado. Configure o backend para produção.');
 
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
         method:  'POST',

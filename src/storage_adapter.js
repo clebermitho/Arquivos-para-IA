@@ -27,7 +27,7 @@ export const _writeQueue = (() => {
     return function enqueue(fn) {
         _pending = _pending
             .then(() => fn())
-            .catch((err) => console.error('[ChatplayExt] _writeQueue erro:', err));
+            .catch((err) => console.error('[AssistentePlayExt] _writeQueue erro:', err));
         return _pending;
     };
 })();
