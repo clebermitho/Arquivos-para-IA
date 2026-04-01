@@ -51,9 +51,9 @@ export function extrairPalavrasChave(texto, limite = 5) {
 }
 
 export function calcularSimilaridadeSemantica(a, b) {
-    let tokensA = tokenizar(a);
+    let pesosA  = tokenizar(a, true);       // {token: peso}
+    let tokensA = Object.keys(pesosA);      // reutiliza tokenização com pesos
     let tokensB = tokenizar(b);
-    let pesosA  = tokenizar(a, true);
 
     if (tokensA.length === 0 || tokensB.length === 0) return 0;
 

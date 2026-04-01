@@ -11,7 +11,7 @@
  */
 'use strict';
 
-import { CONFIG, STORAGE_KEYS, STORAGE_ENV, DEFAULT_BACKEND_URL } from './config.js';
+import { CONFIG, STORAGE_KEYS, STORAGE_ENV } from './config.js';
 import { AppState } from './state.js';
 
 // ── GM_adapter ── síncrono, zero overhead (userscript legado) ─────────────

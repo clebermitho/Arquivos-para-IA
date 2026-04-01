@@ -57,11 +57,20 @@ function inserirNoCampoChatPlay(texto) {
         return;
     }
 
-    const nativeSetter = Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype, "value"
-    ).set;
+    const descriptor = Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement?.prototype, "value"
+    );
+    if (!descriptor?.set) {
+        // Fallback: atribuição direta (sem React synthetic events)
+        campo.value = texto;
+        campo.dispatchEvent(new Event('input',  { bubbles: true }));
+        campo.dispatchEvent(new Event('change', { bubbles: true }));
+        campo.focus();
+        mostrarNotificacao("✅ Resposta inserida no chat!");
+        return;
+    }
 
-    nativeSetter.call(campo, texto);
+    descriptor.set.call(campo, texto);
     campo.dispatchEvent(new Event('input',  { bubbles: true }));
     campo.dispatchEvent(new Event('change', { bubbles: true }));
     campo.focus();

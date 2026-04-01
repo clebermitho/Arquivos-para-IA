@@ -80,7 +80,16 @@ export function aprenderComRespostasBoas(resposta, categoria) {
 }
 
 // Mapa de controle de rate: evita duplo clique registrar 2x no mesmo intervalo
+// Entradas expiradas (> 10 s) são removidas a cada 50 chamadas para evitar leak de memória.
 const _feedbackLock = new Map();
+let _feedbackLockCallCount = 0;
+
+function _purgeFeedbackLock() {
+    const cutoff = Date.now() - 10000; // 10 segundos
+    for (const [key, ts] of _feedbackLock) {
+        if (ts < cutoff) _feedbackLock.delete(key);
+    }
+}
 
 /**
  * Atualiza o score de acerto/erro de uma resposta.
@@ -96,6 +105,9 @@ export function atualizarScoreResposta(resposta, categoria, foiBoa) {
         return;
     }
     _feedbackLock.set(lockKey, agora);
+
+    // Limpar entradas expiradas a cada 50 chamadas
+    if (++_feedbackLockCallCount % 50 === 0) _purgeFeedbackLock();
 
     if (!AppState.scoresRespostas[chave]) {
         AppState.scoresRespostas[chave] = { acertos: 0, erros: 0, ultimoUso: Date.now() };
