@@ -60,7 +60,15 @@
     {
       "resources": [
         "src/chatplay_core.js",
-        "src/storage_adapter.js"
+        "src/storage_adapter.js",
+        "src/modules/config.js",
+        "src/modules/state.js",
+        "src/modules/storage.js",
+        "src/modules/text_analysis.js",
+        "src/modules/chat_capture.js",
+        "src/modules/knowledge_base.js",
+        "src/modules/backend_api.js",
+        "src/modules/learning_engine.js"
       ],
       "matches": [
         "https://chatplay.com.br/*"

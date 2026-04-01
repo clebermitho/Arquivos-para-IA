@@ -1,754 +1,53 @@
 /**
- * chatplay_core.js — Módulo principal da extensão AssistentePlay
+ * chatplay_core.js — Orquestrador principal da extensão AssistentePlay
  * @version 9.2.0
  *
- * Derivado de: Chatplay_Assistant_v9.1.0.user.js
- * Adaptações para extensão Chrome (MV3):
- *   - STORAGE_ENV = "chrome" → usa chrome_adapter (chrome.storage.local)
- *   - GM_adapter com guards typeof (não lança erro se GM_* ausente)
- *   - CONFIG.OPENAI_KEY = "" → preenchido por carregarAppState()
- *   - setTimeout de bootstrap removido → content_script.js usa MutationObserver
- *   - fetch para api.openai.com via background.js (openAIBridge)
- *   - Exporta: { inicializar }
+ * Este arquivo importa os módulos puros de `src/modules/` e contém apenas os
+ * componentes que dependem de UI (circular deps resolvidos por co-localização):
  *
- * Para migrar chamadas OpenAI para background.js (Fase B):
- *   Substituir fetch() em gerarRespostasIA e gerarRespostaChat
- *   pelo bridge: await openAIBridge({ apiKey, messages, model })
+ *   [M3-UI]  inserirNoCampoChatPlay — inserção DOM + notificação
+ *   [M5]     SuggestionEngine — geração de sugestões (chama UI para feedback)
+ *   [M7]     HistoryManager — histórico (chama UI para notificações)
+ *   [M8]     ChatEngine — mensagens do chat interno (chama UI para renderização)
+ *   [M9]     UI — design system, painéis, toasts, drag
+ *   [M0]     Bootstrap — inicialização, atalhos, API pública
+ *
+ * Módulos puros (sem deps de UI) estão em src/modules/:
+ *   config.js, state.js, storage.js, text_analysis.js,
+ *   chat_capture.js, knowledge_base.js, backend_api.js, learning_engine.js
  */
-/* ══════════════════════════════════════════════════════════════
-   CONFIGURAÇÕES GLOBAIS
-   Migração futura: mover para chrome.storage.sync ou options page
-══════════════════════════════════════════════════════════════ */
+'use strict';
 
+// ── Importações de módulos puros ──────────────────────────────────────────
+import { CONFIG, STORAGE_KEYS, STORAGE_ENV } from './modules/config.js';
+import { AppState } from './modules/state.js';
+import {
+    storageSet, storageUpdate, storageDel,
+    carregarAppState, garantirEstruturaEstatisticas, _inicializarOnChanged,
+} from './modules/storage.js';
+import {
+    normalizar, tokenizar, classificarIntencao, calcularSimilaridadeSemantica,
+} from './modules/text_analysis.js';
+import { capturarMensagens, detectarPergunta } from './modules/chat_capture.js';
+import { carregarConhecimentoCoren, carregarConhecimentoChat } from './modules/knowledge_base.js';
+import { BackendAPI } from './modules/backend_api.js';
+import {
+    salvarSugestaoNoLog, registrarRespostaDesaprovada,
+    atualizarScoreResposta, getMelhoresRespostas, calcularTaxaAcertoMedia,
+} from './modules/learning_engine.js';
 
-/* ══════════════════════════════════════════════════════════════
-   BRIDGE — OpenAI via background.js (sem CORS em extensão MV3)
-   Substitui fetch() direto para api.openai.com.
-
-   Em userscript (fallback): usa fetch() diretamente se
-   chrome.runtime não estiver disponível.
-══════════════════════════════════════════════════════════════ */
-async function openAIBridge({ apiKey, messages, model = 'gpt-4o-mini', max_tokens = 500, temperature = 0.7 }) {
-    // Se estiver rodando como extensão Chrome — delega ao background.js (sem CORS)
-    if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
-        return new Promise((resolve, reject) => {
-            chrome.runtime.sendMessage(
-                { type: 'OPENAI_REQUEST', payload: { apiKey, messages, model, max_tokens, temperature } },
-                (response) => {
-                    if (chrome.runtime.lastError) {
-                        reject(new Error(chrome.runtime.lastError.message));
-                        return;
-                    }
-                    if (!response || !response.ok) {
-                        reject(new Error((response && response.error) || 'Erro no background.js'));
-                        return;
-                    }
-                    resolve(response.data);
-                }
-            );
-        });
-    }
-
-    // Fallback: fetch direto (userscript / ambiente sem chrome.runtime)
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-            'Content-Type':  'application/json',
-            'Authorization': 'Bearer ' + apiKey,
-        },
-        body: JSON.stringify({ model, messages, temperature, max_tokens }),
-    });
-    if (!response.ok) {
-        const err = await response.text().catch(() => '');
-        throw new Error(`HTTP ${response.status}: ${err.substring(0, 100)}`);
-    }
-    return response.json();
-}
-
-
-/* ══════════════════════════════════════════════════════════════
-   BACKEND API CLIENT — camada de comunicação com chatplay-backend
-   Todas as chamadas à OpenAI passam por aqui em modo backend.
-   Fallback: openAIBridge() se BACKEND_URL não estiver configurado.
-══════════════════════════════════════════════════════════════ */
-
-const BackendAPI = {
-    /**
-     * Executa fetch autenticado ao backend.
-     * Injeta Bearer token automaticamente.
-     */
-    async request(path, options = {}) {
-        // Sempre relê token e URL do storage antes de cada chamada
-        // Evita "logado no popup mas sem token no core" após reload de página
-        const stored = await chrome.storage.local.get([
-            'backend_token_v1',
-            'chatplay_backend_url',
-            'backend_refresh_token_v1',
-        ]);
-        if (stored['backend_token_v1'])  CONFIG.BACKEND_TOKEN = stored['backend_token_v1'];
-        if (stored['chatplay_backend_url']) CONFIG.BACKEND_URL = stored['chatplay_backend_url'];
-
-        const url = `${CONFIG.BACKEND_URL}${path}`;
-
-        const doReq = async (token) => {
-            const headers = {
-                'Content-Type': 'application/json',
-                ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
-                ...(options.headers || {}),
-            };
-            return fetch(url, { ...options, headers });
-        };
-
-        let response = await doReq(CONFIG.BACKEND_TOKEN);
-
-        // Refresh automático em 401 — resolve login aparente mas token expirado
-        if (response.status === 401 && stored['backend_refresh_token_v1']) {
-            try {
-                const rRes = await fetch(`${CONFIG.BACKEND_URL}/api/auth/refresh`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ refreshToken: stored['backend_refresh_token_v1'] }),
-                });
-                if (rRes.ok) {
-                    const rData = await rRes.json();
-                    CONFIG.BACKEND_TOKEN = rData.token;
-                    await chrome.storage.local.set({ 'backend_token_v1': rData.token });
-                    response = await doReq(CONFIG.BACKEND_TOKEN);
-                }
-            } catch (e) {
-                console.warn('[ChatplayCore] Refresh automático falhou:', e.message);
-            }
-        }
-
-        if (!response.ok) {
-            const err = await response.json().catch(() => ({}));
-            throw new Error(err.error || `Backend HTTP ${response.status}`);
-        }
-        return response.json();
-    },
-
-    /** Login — salva token no CONFIG e no storage */
-    async login(credential, password) {
-        const loginBody = credential.includes('@')
-            ? { email: credential, password }
-            : { username: credential, password };
-        const data = await this.request('/api/auth/login', {
-            method: 'POST',
-            body: JSON.stringify(loginBody),
-        });
-        CONFIG.BACKEND_TOKEN = data.token;
-        storageSet(STORAGE_KEYS.BACKEND_TOKEN, data.token);
-        return data;
-    },
-
-    /** Gera sugestões via backend (OpenAI fica no servidor) */
-    async generateSuggestions({ context, question, category, topExamples = [], avoidPatterns = [] }) {
-        return this.request('/api/ai/suggestions', {
-            method: 'POST',
-            body: JSON.stringify({ context, question, category, topExamples, avoidPatterns }),
-        });
-    },
-
-    /** Chat IA via backend */
-    async chatReply({ message, history = [], context = "" }) {
-        return this.request('/api/ai/chat', {
-            method: 'POST',
-            body: JSON.stringify({ message, history, context }),
-        });
-    },
-
-    /** Registra evento de uso (fire-and-forget) */
-    logEvent(eventType, payload = {}) {
-        this.request('/api/events', {
-            method: 'POST',
-            body: JSON.stringify({ eventType, payload }),
-        }).catch(err => console.warn('[ChatplayExt] Evento não registrado:', err.message));
-    },
-
-    /** Envia feedback de sugestão */
-    async sendFeedback(suggestionId, type, reason = null) {
-        const body = { suggestionId, type };
-        if (reason !== null && reason !== undefined) body.reason = reason;
-        return this.request('/api/feedback', {
-            method: 'POST',
-            body: JSON.stringify(body),
-        });
-    },
-
-    /** Busca configurações da org */
-    async getSettings() {
-        return this.request('/api/settings');
-    },
-
-    /** Verifica se o backend está acessível */
-    async ping() {
-        try {
-            await fetch(`${CONFIG.BACKEND_URL}/health`);
-            return true;
-        } catch { return false; }
-    },
-};
-
-const CONFIG = {
-    OPENAI_KEY: "", // legado — em modo extensão a chave fica no servidor
-    BACKEND_URL: "https://backend-assistant-0x1d.onrender.com", // URL padrão do servidor de produção
-    BACKEND_TOKEN: "", // preenchido por carregarAppState() ou após login
-    MAX_HISTORY_SIZE: 1000,
-    SIMILARITY_THRESHOLD: 0.65,
-    MAX_MESSAGES_TO_CAPTURE: 12,
-    KNOWLEDGE_BASE_COREN: "https://raw.githubusercontent.com/clebermitho/knowledge-base/main/base_coren.json",
-    KNOWLEDGE_BASE_CHAT: "https://raw.githubusercontent.com/clebermitho/knowledge-base/main/programa%C3%A7%C3%A3o%20ia.json",
-    THEME: {
-        primary: "#4f46e5",
-        secondary: "#10b981",
-        danger: "#ef4444",
-        warning: "#f59e0b",
-        dark: "#0f172a",
-        light: "#f8fafc",
-        card: "#1e293b"
-    }
-};
-
-/* ══════════════════════════════════════════════════════════════
-   ESTADO DA APLICAÇÃO
-   Migração futura: dividir em slices por módulo (Redux-like)
-══════════════════════════════════════════════════════════════ */
-
-/**
- * AppState — estado global da aplicação.
- * Declarado vazio aqui; preenchido por carregarAppState() no Bootstrap.
- * Isso permite inicialização async (chrome.storage) sem alterar os módulos.
- */
-let AppState = {
-    historico:              [],
-    logSugestoes:           {},
-    templates: {
-        NEGOCIACAO: [], SUSPENSAO: [], CANCELAMENTO: [],
-        DUVIDA: [], RECLAMACAO: [], OUTROS: []
-    },
-    sugestoesDesaprovadas:  { respostas: [], padroes: [], categorias: {} },
-    preferencias: {
-        tema: "auto", notificacoes: true, autoSugestao: true,
-        evitarDesaprovadas: true, usarTemplates: true, modoEconomico: false
-    },
-    estatisticas:           null, // preenchido por carregarAppState()
-    sugestaoAtual:          null,
-    scoresRespostas:        {},
-    chatMessages:           [],
-};
-
-// Variáveis de controle de UI (não persistidas)
-let isGenerating        = false;
-let conhecimentoBaseCoren = null;
-let conhecimentoBaseChat  = null;
+// ── Variáveis de controle de UI (não persistidas, locais a este módulo) ───
+let isGenerating             = false;
 let sugestaoSelecionadaAtual = null; // rastreia botão selecionado visualmente
 
 /* ══════════════════════════════════════════════════════════════
-   [M1] MODULE: Storage
-   Persistência, inicialização de estado, fila de escrita e limpeza.
-
-   ┌─────────────────────────────────────────────────────────────┐
-   │  StorageAdapter — troca de backend sem alterar o restante   │
-   │  ENV = "gm"     → usa GM_setValue / GM_getValue (userscript)│
-   │  ENV = "chrome" → usa chrome.storage.local (extensão)       │
-   │  Para migrar: alterar STORAGE_ENV = "chrome" + Fase B async │
-   └─────────────────────────────────────────────────────────────┘
-
-   Fase A  (atual)  : GM_adapter ativo, _writeQueue preparada
-   Fase B  (extensão): chrome_adapter ativo, storageSet/Get async
-   Fase C  (multi-aba): onChanged listener ativo (já incluído)
+   [M3-UI] inserirNoCampoChatPlay
+   Inserção de texto no campo de mensagem do Chatplay via nativeSetter.
+   Mantido aqui pois depende de mostrarNotificacao (M9).
 ══════════════════════════════════════════════════════════════ */
-
-/**
- * ── STORAGE ENV ───────────────────────────────────────────────
- * "gm"     → userscript (Tampermonkey / Greasemonkey)
- * "chrome" → extensão Chrome/Edge/Firefox (Fase B)
- * Altere aqui para ativar o adaptador correto.
- */
-const STORAGE_ENV = "chrome"; // ← extensão Chrome: usa chrome_adapter
-
-/* ── GM_adapter ── síncrono, zero overhead ───────────────────── */
-const GM_adapter = {
-    get:    (key, fallback = null) => {
-        if (typeof GM_getValue === 'undefined') return fallback;
-        const raw = GM_getValue(key, undefined);
-        if (raw === undefined) return fallback;
-        try { return typeof raw === "string" ? JSON.parse(raw) : raw; }
-        catch { return raw; }
-    },
-    set:    (key, value) => { if (typeof GM_setValue !== 'undefined') GM_setValue(key, JSON.stringify(value)); },
-    del:    (key)        => { if (typeof GM_deleteValue !== 'undefined') GM_deleteValue(key); },
-    getMany: (keys)      => {
-        const result = {};
-        keys.forEach(k => { result[k] = GM_adapter.get(k); });
-        return result;
-    },
-    isAsync: false,
-};
-
-/* ── chrome_adapter ── assíncrono, para extensão (Fase B) ───── */
-const chrome_adapter = {
-    get: async (key, fallback = null) => {
-        const r = await chrome.storage.local.get(key);
-        return r[key] !== undefined ? r[key] : fallback;
-    },
-    set: async (key, value) => chrome.storage.local.set({ [key]: value }),
-    del: async (key)        => chrome.storage.local.remove(key),
-    getMany: async (keys)   => {
-        const r = await chrome.storage.local.get(keys);
-        return r;
-    },
-    isAsync: true,
-};
-
-/** Adaptador ativo — trocar STORAGE_ENV altera o backend inteiro */
-const _adapter = STORAGE_ENV === "chrome" ? chrome_adapter : GM_adapter;
-
-/* ── _writeQueue ── mutex FIFO para escritas concorrentes ─────
- *  Resolve o problema de Lost Update em operações read-modify-write.
- *  Cada storageSet/storageSetQueued enfileira e aguarda a anterior.
- *  Em Fase B (chrome.storage async), protege contra race conditions.
- *  Diagrama: Promise.resolve() → .then(opA) → .then(opB) → .then(opC)
- *  Ref: https://developer.chrome.com/docs/extensions/reference/storage/
- * ────────────────────────────────────────────────────────────── */
-const _writeQueue = (() => {
-    let _pending = Promise.resolve();
-    return function enqueue(fn) {
-        // Encadeia fn no final — cada .then só roda quando o anterior resolve
-        _pending = _pending
-            .then(() => fn())
-            .catch((err) => {
-                console.error("[Chatplay Assistant] ⚠️ _writeQueue erro (isolado):", err);
-            });
-        return _pending; // chamador pode await se precisar
-    };
-})();
-
-/* ── STORAGE_KEYS ── mapa centralizado de chaves ─────────────── */
-const STORAGE_KEYS = {
-    OPENAI_KEY:     "openai_key",
-    BACKEND_TOKEN:  "backend_token_v1",
-    REFRESH_TOKEN:  "backend_refresh_token_v1",
-    HISTORICO:      "historico_ai_v7",
-    LOG_SUGESTOES:  "log_sugestoes_v7",
-    TEMPLATES:      "templates_ia_v7",
-    DESAPROVADAS:   "sugestoes_desaprovadas_v7",
-    SCORES:         "scores_respostas_v7",
-    CHAT_MSGS:      "chat_messages_v7",
-    STATS:          "estatisticas_v7",
-    // Legadas (mantidas para limpeza controlada)
-    _LEGACY_CACHE:      "cache_respostas_v7",
-    _LEGACY_HISTORICO:  "historico_respostas_v7",
-};
-
-/* ── Wrappers públicos ────────────────────────────────────────── */
-
-/**
- * Lê um valor do storage com fallback.
- * GM_adapter: síncrono | chrome_adapter: retorna Promise
- */
-function storageGet(key, fallback = null) {
-    return _adapter.get(key, fallback);
-}
-
-/**
- * Salva um valor no storage — todas as escritas passam pela _writeQueue.
- * Garante serialização FIFO: sem Lost Update mesmo com múltiplas chamadas.
- * @param {string} key
- * @param {*} value
- * @returns {Promise}
- */
-function storageSet(key, value) {
-    return _writeQueue(() => _adapter.set(key, value));
-}
-
-/**
- * Operação read-modify-write atômica dentro da _writeQueue.
- * Uso: quando a escrita depende do valor atual (incremento, append).
- * @param {string} key
- * @param {function(currentValue): newValue} updateFn
- * @param {*} fallback valor inicial se a chave não existir
- * @returns {Promise}
- */
-function storageUpdate(key, updateFn, fallback = null) {
-    return _writeQueue(async () => {
-        const current = await Promise.resolve(_adapter.get(key, fallback));
-        const updated = updateFn(current);
-        await Promise.resolve(_adapter.set(key, updated));
-        return updated;
-    });
-}
-
-/**
- * Leitura em batch — mais eficiente e reduz janelas de vulnerabilidade.
- * chrome_adapter: usa chrome.storage.local.get([keys]) — operação atômica nativa.
- * @param {string[]} keys
- * @returns {Object|Promise<Object>}
- */
-function storageGetMany(keys) {
-    return _adapter.getMany(keys);
-}
-
-/**
- * Remove uma chave do storage.
- */
-function storageDel(key) {
-    return _writeQueue(() => _adapter.del(key));
-}
-
-/* ── garantirEstruturaEstatisticas ───────────────────────────── */
-function garantirEstruturaEstatisticas(estatisticas) {
-    if (!estatisticas) {
-        estatisticas = {
-            totalSugestoes: 0, totalEconomiaAPI: 0, totalDesaprovadas: 0,
-            totalCacheHits: 0, totalTemplateUso: 0,
-            categoriasMaisUsadas: {},
-            performance: { tempoMedioResposta: 0, totalTempo: 0, chamadasAPI: 0 }
-        };
-    }
-    if (!estatisticas.performance) {
-        estatisticas.performance = { tempoMedioResposta: 0, totalTempo: 0, chamadasAPI: 0 };
-    }
-    estatisticas.performance.chamadasAPI        = estatisticas.performance.chamadasAPI        ?? 0;
-    estatisticas.performance.totalTempo         = estatisticas.performance.totalTempo         ?? 0;
-    estatisticas.performance.tempoMedioResposta = estatisticas.performance.tempoMedioResposta ?? 0;
-    return estatisticas;
-}
-
-/* ── carregarAppState ────────────────────────────────────────────
- *  Fase A: ainda síncrono com GM_adapter.
- *  Fase B: trocar storageGetMany por await _adapter.getMany(keys).
- *  Estrutura async já preparada para a troca sem alterar chamadores.
- * ────────────────────────────────────────────────────────────── */
-async function carregarAppState() {
-    // Leitura em batch — um único get em vez de N gets separados
-    const keys = [
-        STORAGE_KEYS.OPENAI_KEY,
-        STORAGE_KEYS.BACKEND_TOKEN,
-        STORAGE_KEYS.REFRESH_TOKEN,
-        'chatplay_backend_url',
-        STORAGE_KEYS.HISTORICO,
-        STORAGE_KEYS.LOG_SUGESTOES,
-        STORAGE_KEYS.TEMPLATES,
-        STORAGE_KEYS.DESAPROVADAS,
-        STORAGE_KEYS.SCORES,
-        STORAGE_KEYS.CHAT_MSGS,
-        STORAGE_KEYS.STATS,
-    ];
-
-    // Em Fase A: getMany é síncrono; em Fase B: await retorna Promise
-    const stored = await Promise.resolve(storageGetMany(keys));
-
-    // Preenche AppState a partir do batch
-    AppState.historico            = stored[STORAGE_KEYS.HISTORICO]   || [];
-    AppState.logSugestoes         = stored[STORAGE_KEYS.LOG_SUGESTOES] || {};
-    AppState.templates            = stored[STORAGE_KEYS.TEMPLATES]   || {};
-    AppState.sugestoesDesaprovadas = stored[STORAGE_KEYS.DESAPROVADAS] || {
-        respostas: [], categorias: {}, padroes: []
-    };
-    AppState.scoresRespostas      = stored[STORAGE_KEYS.SCORES]      || {};
-    AppState.chatMessages         = stored[STORAGE_KEYS.CHAT_MSGS]   || [];
-    AppState.estatisticas         = garantirEstruturaEstatisticas(stored[STORAGE_KEYS.STATS]);
-
-    // Atualiza chave OpenAI se salva no storage (legado)
-    const savedKey = stored[STORAGE_KEYS.OPENAI_KEY];
-    if (savedKey) CONFIG.OPENAI_KEY = savedKey;
-
-    // Carregar token e URL do backend configurados pelo popup
-    const savedToken   = stored[STORAGE_KEYS.BACKEND_TOKEN];
-    const savedBkUrl   = stored['chatplay_backend_url'];
-    if (savedToken) CONFIG.BACKEND_TOKEN = savedToken;
-    if (savedBkUrl) CONFIG.BACKEND_URL   = savedBkUrl;
-
-    console.log("[Chatplay Assistant] 📦 AppState carregado (batch).");
-}
-
-/* ── onChanged — sincronização multi-aba (Fase C) ────────────────
- *  Detecta escritas de outras abas/processos e reconcilia AppState.
- *  Estratégia: Last-Write-Wins para scores (Math.max por campo).
- *  Ativa apenas no ambiente chrome (extensão).
- * ────────────────────────────────────────────────────────────── */
-function _inicializarOnChanged() {
-    if (STORAGE_ENV !== "chrome" || typeof chrome === "undefined" || !chrome.storage) return;
-
-    chrome.storage.onChanged.addListener((changes, area) => {
-        if (area !== "local") return;
-
-        // Sincronizar scores (LWW por campo — sem regredir)
-        if (changes[STORAGE_KEYS.SCORES]) {
-            const externo = changes[STORAGE_KEYS.SCORES].newValue || {};
-            Object.keys(externo).forEach(resp => {
-                const local = AppState.scoresRespostas[resp];
-                if (!local) {
-                    AppState.scoresRespostas[resp] = externo[resp];
-                } else {
-                    local.acertos  = Math.max(local.acertos,  externo[resp].acertos  || 0);
-                    local.erros    = Math.max(local.erros,    externo[resp].erros    || 0);
-                    local.ultimoUso = Math.max(local.ultimoUso || 0, externo[resp].ultimoUso || 0);
-                }
-            });
-            console.log("[Chatplay Assistant] 🔄 onChanged: scores sincronizados (multi-aba).");
-        }
-
-        // Sincronizar log de sugestões (merge por categoria)
-        if (changes[STORAGE_KEYS.LOG_SUGESTOES]) {
-            const externo = changes[STORAGE_KEYS.LOG_SUGESTOES].newValue || {};
-            Object.keys(externo).forEach(cat => {
-                if (!AppState.logSugestoes[cat]) {
-                    AppState.logSugestoes[cat] = externo[cat];
-                } else {
-                    // Deduplica por id
-                    const ids = new Set(AppState.logSugestoes[cat].map(r => r.id));
-                    externo[cat].forEach(r => { if (!ids.has(r.id)) AppState.logSugestoes[cat].push(r); });
-                }
-            });
-            console.log("[Chatplay Assistant] 🔄 onChanged: logSugestoes sincronizado (multi-aba).");
-        }
-
-        // Sincronizar estatísticas (Math.max por contador)
-        if (changes[STORAGE_KEYS.STATS]) {
-            const ext = changes[STORAGE_KEYS.STATS].newValue;
-            if (ext) {
-                AppState.estatisticas.totalSugestoes   = Math.max(AppState.estatisticas.totalSugestoes   || 0, ext.totalSugestoes   || 0);
-                AppState.estatisticas.totalDesaprovadas= Math.max(AppState.estatisticas.totalDesaprovadas|| 0, ext.totalDesaprovadas|| 0);
-                AppState.estatisticas.totalEconomiaAPI = Math.max(AppState.estatisticas.totalEconomiaAPI || 0, ext.totalEconomiaAPI || 0);
-            }
-        }
-    });
-
-    console.log("[Chatplay Assistant] 🌐 onChanged listener ativo (modo extensão).");
-}
-
-/** @namespace Storage — ponto de acesso público do módulo */
-const Storage = {
-    storageGet,
-    storageSet,
-    storageUpdate,
-    storageDel,
-    storageGetMany,
-    carregarAppState,
-    garantirEstruturaEstatisticas,
-    STORAGE_KEYS,
-    _writeQueue,
-    _inicializarOnChanged,
-    _adapter,
-    STORAGE_ENV,
-};
-
-/* ══════════════════════════════════════════════════════════════
-   [M2] MODULE: TextAnalysis
-   Normalização, tokenização, palavras-chave, similaridade e classificação.
-   Migração futura: Isolar como Web Worker ou microserviço de NLP
-══════════════════════════════════════════════════════════════ */
-
-function normalizar(txt) {
-    if (!txt) return "";
-    return txt
-        .toLowerCase()
-        .normalize("NFD")
-        .replace(/[\u0300-\u036f]/g, "")
-        .replace(/[^\w\s]/g, "")
-        .replace(/\s+/g, " ")
-        .trim();
-}
-
-function tokenizar(texto, pesos = false) {
-    let palavras = normalizar(texto)
-        .split(" ")
-        .filter(p => p.length > 2);
-
-    if (!pesos) return palavras;
-
-    let totalDocs = AppState.historico.length || 1;
-    let pesosMap = {};
-
-    palavras.forEach(p => {
-        let freqDoc = palavras.filter(w => w === p).length;
-        let docsComPalavra = AppState.historico.filter(h =>
-            h.tokens && h.tokens.includes(p)
-        ).length;
-
-        let idf = Math.log(totalDocs / (1 + docsComPalavra));
-        pesosMap[p] = freqDoc * idf;
-    });
-
-    return pesosMap;
-}
-
-function extrairPalavrasChave(texto, limite = 5) {
-    let pesos = tokenizar(texto, true);
-    return Object.entries(pesos)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, limite)
-        .map(([palavra]) => palavra);
-}
-
-function calcularSimilaridadeSemantica(a, b){
-    let tokensA = tokenizar(a);
-    let tokensB = tokenizar(b);
-    let pesosA = tokenizar(a, true);
-    let pesosB = tokenizar(b, true);
-
-    if(tokensA.length === 0 || tokensB.length === 0) return 0;
-
-    let stopwords = ["para", "como", "com", "uma", "pelos", "sobre", "entre", "após", "durante", "mediante", "mas", "pois", "portanto"];
-
-    let score = 0;
-    let pesoTotal = 0;
-
-    tokensA.forEach(token => {
-        let pesoToken = pesosA[token] || 1;
-        if (stopwords.includes(token)) pesoToken *= 0.3;
-
-        if(tokensB.includes(token)){
-            let bonus = token.length > 6 ? 1.5 : 1;
-            score += pesoToken * bonus;
-        }
-        pesoTotal += pesoToken;
-    });
-
-    let normalizado = pesoTotal > 0 ? score / pesoTotal : 0;
-
-    let categoriaA = classificarIntencao(a);
-    let categoriaB = classificarIntencao(b);
-    if(categoriaA === categoriaB){
-        normalizado += 0.2;
-    }
-
-    return Math.min(normalizado, 1);
-}
-
-function classificarIntencao(texto) {
-    let t = normalizar(texto);
-
-    const categorias = {
-        SUSPENSAO: {
-            palavras: ["suspens", "suspende", "paralisar", "interromper", "pausar", "baixa temporária"],
-            peso: 1.5
-        },
-        CANCELAMENTO: {
-            palavras: ["cancel", "cancela", "encerrar", "terminar", "desistir", "anular", "excluir"],
-            peso: 1.5
-        },
-        NADA_CONSTA: {
-            palavras: ["nada consta", "não consta", "sem registro", "não encontrado", "inexistente"],
-            peso: 2.0
-        },
-        GOLPE: {
-            palavras: ["golpe", "fraude", "enganaram", "problema", "suspeito", "estelionato"],
-            peso: 2.0
-        },
-        PRAZO: {
-            palavras: ["prazo", "tempo", "demora", "quanto tempo", "previsão", "quando", "data limite"],
-            peso: 1.2
-        },
-        NEGOCIACAO: {
-            palavras: ["parcel", "negoci", "acordo", "divid", "débito", "dev", "anuidade", "regularizar", "pagamento"],
-            peso: 1.3
-        },
-        SEM_DINHEIRO: {
-            palavras: ["dinheiro", "pagar", "sem condi", "caro", "valor alto", "difícil", "apertado"],
-            peso: 1.3
-        },
-        DUVIDA: {
-            palavras: ["dúvida", "dúvidas", "esclarec", "entender", "como funciona", "explicar", "significa"],
-            peso: 1.0
-        },
-        RECLAMACAO: {
-            palavras: ["reclam", "problema", "erro", "não funciona", "ruim", "péssimo", "insatisfeito"],
-            peso: 1.2
-        }
-    };
-
-    let scores = {};
-
-    for (let [categoria, config] of Object.entries(categorias)) {
-        let score = 0;
-        for (let palavra of config.palavras) {
-            if (t.includes(palavra)) {
-                score += config.peso;
-            }
-        }
-        if (score > 0) {
-            scores[categoria] = score;
-        }
-    }
-
-    if (t.includes("não") || t.includes("nunca") || t.includes("jamais")) {
-        for (let cat in scores) {
-            scores[cat] *= 0.8;
-        }
-    }
-
-    if (Object.keys(scores).length > 0) {
-        return Object.entries(scores).sort((a, b) => b[1] - a[1])[0][0];
-    }
-
-    return "OUTROS";
-}
-
-
-/** @namespace TextAnalysis — ponto de acesso público do módulo */
-const TextAnalysis = {
-    normalizar,
-    tokenizar,
-    extrairPalavrasChave,
-    calcularSimilaridadeSemantica,
-    classificarIntencao,
-};
-
-/* ══════════════════════════════════════════════════════════════
-   [M3] MODULE: ChatCapture
-   Localização de elementos DOM, captura de mensagens e inserção de texto.
-   Migração futura: Migrar para content_script da extensão
-══════════════════════════════════════════════════════════════ */
-
-function capturarMensagens(qtd = CONFIG.MAX_MESSAGES_TO_CAPTURE) {
-    let msgs = [...document.querySelectorAll("span[class*='foreground']")];
-    if (msgs.length === 0) return [];
-
-    let lista = msgs.slice(-qtd).map(m => ({
-        autor: descobrirAutor(m),
-        texto: m.textContent ? m.textContent.trim() : m.innerText.trim(),
-        timestamp: Date.now()
-    }));
-
-    console.log(`[Chatplay Assistant] 📨 Mensagens capturadas: ${lista.length}`);
-    return lista;
-}
-
-function descobrirAutor(el) {
-    let node = el;
-    while (node) {
-        if (node.className && node.className.includes("bg-secondary")) return "CLIENTE";
-        if (node.className && node.className.includes("self-end")) return "OPERADOR";
-        node = node.parentElement;
-    }
-    return "OPERADOR";
-}
-
-function detectarPergunta(mensagens) {
-    let ignorar = ["ok", "sim", "obrigado", "valeu", "👍", "...", "entendi", "certo"];
-    let clienteMsgs = mensagens.filter(m => m.autor === "CLIENTE");
-
-    let validas = clienteMsgs.filter(m => {
-        let t = normalizar(m.texto);
-        if (t.length < 5) return false;
-        if (ignorar.includes(t)) return false;
-        if (/^(ok|sim|não|talvez)$/i.test(t)) return false;
-        return true;
-    });
-
-    if (validas.length === 0) {
-        return clienteMsgs[clienteMsgs.length - 1]?.texto || "";
-    }
-
-    return validas[validas.length - 1].texto;
-}
 
 function inserirNoCampoChatPlay(texto) {
     let campo = document.querySelector("textarea[placeholder*='Digite sua mensagem']");
-
     if (!campo) campo = document.querySelector("textarea");
     if (!campo) campo = document.querySelector("input[type='text']");
 
@@ -758,89 +57,37 @@ function inserirNoCampoChatPlay(texto) {
         return;
     }
 
-    const nativeSetter = Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype,
-        "value"
-    ).set;
+    const descriptor = Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement?.prototype, "value"
+    );
+    if (!descriptor?.set) {
+        // Fallback: atribuição direta (sem React synthetic events)
+        campo.value = texto;
+        campo.dispatchEvent(new Event('input',  { bubbles: true }));
+        campo.dispatchEvent(new Event('change', { bubbles: true }));
+        campo.focus();
+        mostrarNotificacao("✅ Resposta inserida no chat!");
+        return;
+    }
 
-    nativeSetter.call(campo, texto);
-
-    campo.dispatchEvent(new Event('input', { bubbles: true }));
+    descriptor.set.call(campo, texto);
+    campo.dispatchEvent(new Event('input',  { bubbles: true }));
     campo.dispatchEvent(new Event('change', { bubbles: true }));
-
     campo.focus();
 
     console.log(`[Chatplay Assistant] 📝 Mensagem inserida: "${texto.substring(0, 70)}..."`);
     mostrarNotificacao("✅ Resposta inserida no chat!");
 }
 
-
-/** @namespace ChatCapture — ponto de acesso público do módulo */
-const ChatCapture = {
-    capturarMensagens,
-    descobrirAutor,
-    detectarPergunta,
-    inserirNoCampoChatPlay,
-};
-
-/* ══════════════════════════════════════════════════════════════
-   [M4] MODULE: KnowledgeBase
-   Carregamento e cache das bases de conhecimento externas.
-   Migração futura: Cachear no service worker da extensão via Cache API
-══════════════════════════════════════════════════════════════ */
-
-async function carregarConhecimentoCoren() {
-    if (conhecimentoBaseCoren) return conhecimentoBaseCoren;
-
-    try {
-        console.log("[Chatplay Assistant] 📚 Carregando base de conhecimento COREN...");
-        const response = await fetch(CONFIG.KNOWLEDGE_BASE_COREN);
-        conhecimentoBaseCoren = await response.json();
-        console.log("[Chatplay Assistant] ✅ Base COREN carregada!");
-        return conhecimentoBaseCoren;
-    } catch (error) {
-        console.error("[Chatplay Assistant] ❌ Erro ao carregar base COREN:", error);
-        return null;
-    }
-}
-
-async function carregarConhecimentoChat() {
-    if (conhecimentoBaseChat) return conhecimentoBaseChat;
-
-    try {
-        console.log("[Chatplay Assistant] 📚 Carregando base de conhecimento do Chat...");
-        const response = await fetch(CONFIG.KNOWLEDGE_BASE_CHAT);
-        conhecimentoBaseChat = await response.json();
-        console.log("[Chatplay Assistant] ✅ Base do Chat carregada!");
-        return conhecimentoBaseChat;
-    } catch (error) {
-        console.error("[Chatplay Assistant] ❌ Erro ao carregar base do Chat:", error);
-        return null;
-    }
-}
-
-
-/** @namespace KnowledgeBase — ponto de acesso público do módulo */
-const KnowledgeBase = {
-    carregarConhecimentoCoren,
-    carregarConhecimentoChat,
-};
-
 /* ══════════════════════════════════════════════════════════════
    [M5] MODULE: SuggestionEngine
-   Templates, montagem de contexto, chamada OpenAI e fallback de respostas.
-   Migração futura: Mover gerarRespostasIA para background/service worker via message passing
+   Templates, montagem de contexto e chamada ao backend para sugestões.
 ══════════════════════════════════════════════════════════════ */
 
 function getTemplatesParaCategoria(categoria) {
     if (!AppState.preferencias.usarTemplates) return [];
-
     let templates = AppState.templates[categoria] || [];
-
-    if (templates.length === 0) {
-        templates = getTemplatesPadrao(categoria);
-    }
-
+    if (templates.length === 0) templates = getTemplatesPadrao(categoria);
     return templates;
 }
 
@@ -849,30 +96,29 @@ function getTemplatesPadrao(categoria) {
         NEGOCIACAO: [
             "Verifiquei que há anuidades em aberto. Podemos negociar o pagamento de forma parcelada para regularizar sua situação.",
             "Identificamos pendências financeiras. Há opções de parcelamento disponíveis para quitação.",
-            "Para regularizar sua inscrição, é necessário acertar as anuidades em aberto. Posso auxiliar com isso?"
+            "Para regularizar sua inscrição, é necessário acertar as anuidades em aberto. Posso auxiliar com isso?",
         ],
         SUSPENSAO: [
             "A suspensão temporária da inscrição é possível mediante solicitação formal e situação regular.",
             "Para interromper temporariamente o exercício profissional, é necessário protocolar requerimento de baixa temporária.",
-            "A baixa temporária pode ser solicitada quando não houver exercício profissional por período determinado."
+            "A baixa temporária pode ser solicitada quando não houver exercício profissional por período determinado.",
         ],
         CANCELAMENTO: [
             "O cancelamento definitivo da inscrição requer protocolo formal e quitação de débitos existentes.",
             "Para cancelar sua inscrição, é necessário estar em dia com as obrigações e protocolar requerimento.",
-            "O processo de cancelamento de inscrição deve ser formalizado junto ao protocolo geral."
+            "O processo de cancelamento de inscrição deve ser formalizado junto ao protocolo geral.",
         ],
         DUVIDA: [
             "Esclareço que o procedimento correto é conforme orientação do setor responsável.",
             "Para informações detalhadas, recomendo contato direto com nosso setor de atendimento.",
-            "Posso auxiliar com informações gerais, mas casos específicos devem ser verificados no sistema."
+            "Posso auxiliar com informações gerais, mas casos específicos devem ser verificados no sistema.",
         ],
         RECLAMACAO: [
             "Lamento pelo ocorrido. Vamos verificar a situação e dar o devido encaminhamento.",
             "Registrarei sua reclamação para análise do setor responsável.",
-            "Sua manifestação será encaminhada para providências cabíveis."
-        ]
+            "Sua manifestação será encaminhada para providências cabíveis.",
+        ],
     };
-
     return templatesPadrao[categoria] || [];
 }
 
@@ -882,12 +128,10 @@ async function gerarRespostasIA(contexto, pergunta) {
         return null;
     }
 
-    let inicio = Date.now();
     isGenerating = true;
 
     try {
-        // Backend é o caminho oficial para geração de sugestões
-        // Reler token do storage se não estiver em memória (resolve timing no reload)
+        // Garantir que CONFIG tem os valores mais recentes do storage
         if (!CONFIG.BACKEND_TOKEN) {
             try {
                 const _s = await chrome.storage.local.get(['backend_token_v1', 'chatplay_backend_url']);
@@ -895,183 +139,32 @@ async function gerarRespostasIA(contexto, pergunta) {
                 if (_s['chatplay_backend_url']) CONFIG.BACKEND_URL   = _s['chatplay_backend_url'];
             } catch (_) { /* sem chrome.storage */ }
         }
-        if (CONFIG.BACKEND_URL && CONFIG.BACKEND_TOKEN) {
-            console.log("[Chatplay Assistant] 🌐 Gerando sugestões via backend...");
-            const categoria = classificarIntencao(pergunta);
 
-            const result = await BackendAPI.generateSuggestions({
-                context:       contexto,
-                question:      pergunta,
-                category:      categoria,
-                topExamples:   [],
-                avoidPatterns: [],
-            });
-
-            const respostas = result.suggestions.map(s => s.text || s);
-            // Guardar IDs para feedback posterior
-            AppState._lastSuggestions    = respostas;
-            AppState._lastSuggestionIds  = result.suggestions.map(s => s.id).filter(Boolean);
-
-            BackendAPI.logEvent('suggestion.generated', {
-                category:   categoria,
-                count:      respostas.length,
-                latencyMs:  result.latencyMs,
-            });
-
-            isGenerating = false;
-            return respostas;
+        if (!CONFIG.BACKEND_URL || !CONFIG.BACKEND_TOKEN) {
+            mostrarNotificacao('Serviço de IA indisponível. Faça login no popup da extensão.', 'erro');
+            return null;
         }
 
-        // ── DEV/FALLBACK: OpenAI direto — só usado se backend não estiver configurado ──
-        // Sem backend configurado — modo não suportado em produção
-        isGenerating = false;
-        mostrarNotificacao('Serviço de IA indisponível. Faça login no popup da extensão.', 'erro');
-        return null;
-        console.warn("[Chatplay Core] ⚠️ DEV FALLBACK: Usando OpenAI direto. Configure o backend em produção.");
-        console.log("[Chatplay Assistant] 🤖 Chamando API da OpenAI para sugestões (Modo COREN)...");
+        console.log("[Chatplay Assistant] 🌐 Gerando sugestões via backend...");
+        const categoria = classificarIntencao(pergunta);
 
-        const baseCoren = await carregarConhecimentoCoren();
-        const baseChat = await carregarConhecimentoChat();
-
-        let categoria = classificarIntencao(pergunta);
-        let melhoresRespostas = getMelhoresRespostas(categoria, 3);
-
-        let instrucoesEvitar = "";
-        if (AppState.preferencias.evitarDesaprovadas && AppState.sugestoesDesaprovadas.padroes.length > 0) {
-            let topPadroes = AppState.sugestoesDesaprovadas.padroes.slice(0, 5);
-            instrucoesEvitar = `\n\n🚫 EVITE usar estas palavras/frases que já foram desaprovadas: ${topPadroes.map(p => `"${p.palavra}"`).join(", ")}`;
-        }
-
-        let exemplos = "";
-        if (melhoresRespostas.length > 0) {
-            exemplos = `\n\n📚 Exemplos de respostas que funcionaram bem para esta categoria:\n${melhoresRespostas.map(r => `- ${r}`).join('\n')}`;
-        }
-
-        const prompt = `
-Você é um assistente especializado do Coren (Conselho Regional de Enfermagem).
-
-INSTRUÇÕES BASEADAS NA BASE DE CONHECIMENTO:
-BASE COREN:
-${JSON.stringify(baseCoren, null, 2)}
-
-BASE SISTEMA:
-${JSON.stringify(baseChat, null, 2)}
-
-REGRAS IMPORTANTES:
-1. Nunca chame o profissional de "cliente".
-2. Sempre utilize o termo "profissional", mas sem repetir excessivamente.
-3. Não invente leis, resoluções ou procedimentos.
-4. Mantenha respostas curtas, claras e objetivas.
-5. Use tom profissional, acolhedor e seguro.
-6. Sempre conduza para regularização quando envolver débitos.
-7. Se não souber, informe que será verificado com o setor responsável.
-8. Aprenda com exemplos de respostas que já funcionaram bem.
-9. EVITE repetir respostas que foram desaprovadas anteriormente.
-
-REGRAS DE LINGUAGEM (OBRIGATÓRIO):
-- Nunca utilize termos informais.
-- Sempre utilize terminologia oficial do COREN.
-- Substitua automaticamente termos informais pelos oficiais abaixo:
-
-REGRA CRÍTICA DE NEGOCIAÇÃO (OBRIGATÓRIO):
-
-- Nunca confirme valores específicos de parcelas, entrada ou condições solicitadas pelo profissional.
-- Não valide valores como R$ 100,00, R$ 50,00 ou qualquer quantia sugerida pelo profissional.
-- Não monte propostas personalizadas com valores.
-
-- Sempre informe que será necessário verificar no sistema quais condições estão disponíveis.
-
-- Utilize frases como:
-  "Posso verificar no sistema se há alguma condição mais acessível para você"
-  "Vou consultar as possibilidades disponíveis para encontrar a melhor alternativa"
-  "As condições seguem critérios do sistema, mas posso verificar uma opção mais viável para você"
-
-- Nunca diga que pode alterar valores manualmente.
-- Nunca simule negociação fora das regras do sistema.
-
-"carteirinha" → "CIP - Carteira de Identidade Profissional"
-"liberado para trabalhar" → "habilitado legalmente para o exercício profissional"
-"pausar o coren" → "baixa temporária / interrupção de inscrição"
-"dívida" ou "parcela" → "anuidade"
-"estar devendo" → "situação irregular"
-"nome sujo" → "inscrição em dívida ativa"
-"enfermeiro", "auxiliar", "técnico" → "profissional"
-"trabalho" ou "serviço" → "plantão"
-"emprego" → "vínculo profissional"
-"registro" → "inscrição profissional"
-"documento" → "documento obrigatório"
-"multa" → "encargos / penalidade administrativa"
-"pagamento atrasado" → "inadimplência"
-"estar em dia" → "situação regular"
-"fiscalização" → "ação fiscalizatória"
-"advertência" ou "aviso" → "notificação" ou "comunicado oficial"
-"cobrança" → "processo administrativo de cobrança"
-"processo" → "procedimento administrativo"
-"justiça" → "esfera judicial"
-"processo na justiça" → "execução fiscal"
-"suspensão" → "suspensão do exercício profissional"
-"cancelar registro" → "cancelamento de inscrição"
-"voltar a trabalhar" → "reativação de inscrição"
-"curso" → "capacitação / formação"
-"certificado" → "certidão"
-"prova que está em dia" → "certidão de regularidade"
-
-IMPORTANTE:
-- As respostas devem sempre soar formais, técnicas e institucionais.
-- Evite gírias, linguagem simples demais ou termos populares.
-${instrucoesEvitar}
-${exemplos}
-
-CONTEXTO DA CONVERSA:
-${contexto}
-
-Gere 3 respostas profissionais, objetivas e adequadas ao contexto.
-NÃO use "Resposta 1:", "Resposta 2:" ou qualquer numeração. Apenas o texto da resposta.
-
-Se a resposta não estiver clara ou não houver informação suficiente,
-NUNCA deixe em branco.
-
-Sempre gere uma resposta útil baseada no contexto mais provável.
-`;
-
-        const data = await openAIBridge({
-            messages:    [
-                { role: "system", content: "Gerador de respostas institucionais do Coren" },
-                { role: "user",   content: prompt }
-            ],
-            model:       "gpt-4o-mini",
-            temperature: 0.7,
-            max_tokens:  500,
+        const result = await BackendAPI.generateSuggestions({
+            context:       contexto,
+            question:      pergunta,
+            category:      categoria,
+            topExamples:   getMelhoresRespostas(categoria, 3),
+            avoidPatterns: AppState.sugestoesDesaprovadas.padroes.slice(0, 5).map(p => p.palavra),
         });
 
-        if (!data.choices || !data.choices[0]) {
-            throw new Error("Resposta inválida da API");
-        }
+        const respostas = result.suggestions.map(s => s.text || s);
+        AppState._lastSuggestions   = respostas;
+        AppState._lastSuggestionIds = result.suggestions.map(s => s.id).filter(Boolean);
 
-        let texto = data.choices[0].message.content;
-
-        let respostas = texto
-            .split(/\n\s*\n/)
-            .map(r => r.trim())
-            .filter(r => r.length > 20)
-            .slice(0, 3)
-            .map(r => r.replace(/^Resposta\s*\d+[:.-]?\s*/i, ""));
-
-        if (!AppState.estatisticas.performance) {
-            AppState.estatisticas.performance = {
-                tempoMedioResposta: 0,
-                totalTempo: 0,
-                chamadasAPI: 0
-            };
-        }
-
-        let tempoResposta = Date.now() - inicio;
-        AppState.estatisticas.performance.chamadasAPI = (AppState.estatisticas.performance.chamadasAPI || 0) + 1;
-        AppState.estatisticas.performance.totalTempo = (AppState.estatisticas.performance.totalTempo || 0) + tempoResposta;
-        AppState.estatisticas.performance.tempoMedioResposta =
-            AppState.estatisticas.performance.totalTempo / AppState.estatisticas.performance.chamadasAPI;
-
-        storageSet(STORAGE_KEYS.STATS, AppState.estatisticas);
+        BackendAPI.logEvent('suggestion.generated', {
+            category:  categoria,
+            count:     respostas.length,
+            latencyMs: result.latencyMs,
+        });
 
         return respostas;
 
@@ -1084,13 +177,13 @@ Sempre gere uma resposta útil baseada no contexto mais provável.
     }
 }
 
-async function gerarRespostaChat(mensagem, baseConhecimento) {
-    // Se token não está em memória, tentar reler do storage antes de bloquear
+async function gerarRespostaChat(mensagem) {
+    // Garantir token em memória antes de bloquear
     if (!CONFIG.BACKEND_TOKEN) {
         try {
             const stored = await chrome.storage.local.get(['backend_token_v1', 'chatplay_backend_url']);
-            if (stored['backend_token_v1'])  CONFIG.BACKEND_TOKEN = stored['backend_token_v1'];
-            if (stored['chatplay_backend_url']) CONFIG.BACKEND_URL = stored['chatplay_backend_url'];
+            if (stored['backend_token_v1'])     CONFIG.BACKEND_TOKEN = stored['backend_token_v1'];
+            if (stored['chatplay_backend_url']) CONFIG.BACKEND_URL   = stored['chatplay_backend_url'];
         } catch (_) { /* ignorar se não tiver chrome.storage */ }
     }
     if (!CONFIG.BACKEND_TOKEN) {
@@ -1098,134 +191,27 @@ async function gerarRespostaChat(mensagem, baseConhecimento) {
     }
 
     try {
-        // Backend como primário para o chat IA
-        if (CONFIG.BACKEND_URL && CONFIG.BACKEND_TOKEN) {
-            console.log("[Chatplay Assistant] 🌐 Enviando mensagem para o chat via backend...");
+        console.log("[Chatplay Assistant] 🌐 Enviando mensagem para o chat via backend...");
 
-            // ── Histórico de conversa do chat (últimas 6 trocas) ──
-            const history = AppState.chatMessages
-                .slice(-6)
-                .map(m => ({
-                    role:    m.role    || (m.tipo === 'usuario' ? 'user' : 'assistant'),
-                    content: m.content || m.texto || '',
-                }))
-                .filter(m => m.content.trim() !== '');
+        const history = AppState.chatMessages
+            .slice(-6)
+            .map(m => ({
+                role:    m.role    || (m.tipo === 'usuario' ? 'user' : 'assistant'),
+                content: m.content || m.texto || '',
+            }))
+            .filter(m => m.content.trim() !== '');
 
-            // ── Contexto: mensagens capturadas do chat do Chatplay ──
-            const mensagensCapturadas = capturarMensagens();
-            const contexto = mensagensCapturadas.length > 0
-                ? mensagensCapturadas.map(m => `${m.autor}: ${m.texto}`).join("\n")
-                : "";
+        const mensagensCapturadas = capturarMensagens();
+        const contexto = mensagensCapturadas.length > 0
+            ? mensagensCapturadas.map(m => `${m.autor}: ${m.texto}`).join("\n")
+            : "";
 
-            const result = await BackendAPI.chatReply({
-                message: mensagem,
-                history,
-                context: contexto,
-            });
-            return result.reply;
-        }
-
-        // ── DEV/FALLBACK ──
-        // Sem backend — não há fallback disponível
-        return "Serviço de IA indisponível. Faça login no popup da extensão.";
-        console.warn("[Chatplay Core] ⚠️ DEV FALLBACK: Usando OpenAI direto. Configure o backend em produção.");
-        console.log("[Chatplay Assistant] 🤖 Enviando mensagem para o chat IA (Modo Adaptativo)...");
-
-        let historicoChat = AppState.chatMessages.slice(-10).map(msg =>
-            `${msg.role === "user" ? "Operador" : "Assistente"}: ${msg.content}`
-        ).join("\n");
-
-        const prompt = `
-Você é um assistente inteligente que ajuda um operador humano.
-
-IMPORTANTE:
-- Você está conversando com o OPERADOR (não com o profissional).
-- Responda de forma natural, como uma IA normal (tipo ChatGPT).
-- NÃO assuma automaticamente que toda mensagem envolve atendimento.
-
-CONTEXTO DO SISTEMA (use apenas quando relevante):
-BASE COREN:
-${JSON.stringify(baseConhecimento, null, 2)}
-
-HISTÓRICO:
-${historicoChat}
-
-MENSAGEM:
-${mensagem}
-
-REGRRA PRINCIPAL:
-Antes de responder, identifique o tipo da pergunta:
-
-1. Se for dúvida geral, técnica ou conversa normal:
-→ Responda normalmente, de forma clara e direta.
-
-2. Se for sobre atendimento, cliente, cobrança, ou como responder alguém:
-→ Ative o modo estratégico e responda neste formato(quando possível), se necessário poderá alterar o formato:
-
-
-[MENSAGEM PRONTA]
-
-[Frase de validação empática]
-
-[Explicação técnica de forma simples]
-
-[Oferta de solução, passo a passo ou próximo passo]
-
-Livre para modificar estrutura quando necessário
-
-(chamar de profissional mas evitar fazer isso em 100% das respostas)
-
-
-🎯 Por que essa resposta funciona:
-- [ponto 1]
-- [ponto 2]
-- [ponto 3]
-
-IMPORTANTE:
-- Use emojis adequados: 🤝, 👍, ✅, ⚠️, etc.
-- Use quebras de linha para deixar visualmente agradável
-- Mantenha tom humano e acolhedor
-- Não invente contexto de cliente se não existir
-- Não force respostas estratégicas sem necessidade
-- Seja natural, direto e útil
-- Se a pergunta for ambígua, peça esclarecimento antes de assumir contexto
--Se a pergunta for sobre cancelamento/suspenção/Certidão unica/ certificado/ comprovante de quitação/ Nada consta/ Solicitar Nova carteirinha/ Renovar carteirinha, ou algo parecido
-Poderá encaminhar o passo a passo com o link correto para que o cliente consiga efetuar o procedimento, avisando que qualquer dúvida o cliente deve entrar em contato com a central
--Formule a resposta da melhor forma para o profissional.
-
-REGRA CRÍTICA DE NEGOCIAÇÃO (OBRIGATÓRIO):
-
-- Nunca confirme valores específicos de parcelas, entrada ou condições solicitadas pelo profissional.
-- Não valide valores como R$ 100,00, R$ 50,00 ou qualquer quantia sugerida pelo profissional.
-- Não monte propostas personalizadas com valores.
-
-- Sempre informe que será necessário verificar no sistema quais condições estão disponíveis.
-
-- Utilize frases como:
-  "Posso verificar no sistema se há alguma condição mais acessível para você"
-  "Vou consultar as possibilidades disponíveis para encontrar a melhor alternativa"
-  "As condições seguem critérios do sistema, mas posso verificar uma opção mais viável para você"
-
-- Nunca diga que pode alterar valores manualmente.
-- Nunca simule negociação fora das regras do sistema.
-
-Responda agora:
-`;
-
-        const data = await openAIBridge({
-            messages:    [
-                { role: "system", content: "Assistente inteligente e adaptativo que responde de forma natural, com emojis e quebras de linha quando apropriado" },
-                { role: "user",   content: prompt }
-            ],
-            model:       "gpt-4o-mini",
-            temperature: 0.8,
-            max_tokens:  600,
-        });
-        return data.choices[0].message.content;
+        const result = await BackendAPI.chatReply({ message: mensagem, history, context: contexto });
+        return result.reply;
 
     } catch (error) {
         console.error("[Chatplay Assistant] ❌ Erro na API do chat:", error);
-        return "❌ Erro ao comunicar com a IA. Verifique sua conexão e chave API.";
+        return "❌ Erro ao comunicar com a IA. Verifique sua conexão.";
     }
 }
 
@@ -1254,13 +240,11 @@ async function gerarSugestoesPainel() {
             return;
         }
 
-        const contexto = mensagens.map(m => {
-            return `${m.autor}:\n${m.texto}`;
-        }).join("\n\n") + `\n\nCLIENTE (MENSAGEM PRINCIPAL):\n${pergunta}`;
+        const contexto = mensagens.map(m => `${m.autor}:\n${m.texto}`).join("\n\n")
+            + `\n\nCLIENTE (MENSAGEM PRINCIPAL):\n${pergunta}`;
 
         const categoria = classificarIntencao(pergunta);
 
-        // Verifica histórico primeiro
         let encontrado = buscarNoHistorico(pergunta);
         let respostas;
 
@@ -1274,18 +258,16 @@ async function gerarSugestoesPainel() {
         removerDigitacao();
 
         if (respostas && respostas.length > 0) {
-            // Resetar seleção visual antes de adicionar novas sugestões
             sugestaoSelecionadaAtual = null;
 
             adicionarMensagemAoChat("assistant", JSON.stringify(respostas), "sugestoes", {
-                source: encontrado ? "history" : "fresh",
+                source:   encontrado ? "history" : "fresh",
                 question: pergunta,
-                context: contexto,
+                context:  contexto,
                 category: categoria,
             });
             AppState.ultimaPergunta = pergunta;
 
-            // Salvar no histórico
             salvarNoHistorico(pergunta, respostas, mensagens.map(m => m.texto).join(" "));
         } else {
             mostrarNotificacao("❌ Falha ao gerar sugestões", "erro");
@@ -1298,367 +280,45 @@ async function gerarSugestoesPainel() {
     }
 }
 
-
-/** @namespace SuggestionEngine — ponto de acesso público do módulo */
-const SuggestionEngine = {
-    getTemplatesParaCategoria,
-    getTemplatesPadrao,
-    gerarRespostasIA,
-    gerarRespostaChat,
-    gerarSugestoesPainel,
-};
-
-/* ══════════════════════════════════════════════════════════════
-   [M6] MODULE: LearningEngine
-   Feedback de respostas, scores, aprendizado de templates e métricas.
-   Migração futura: Centralizar em backend para compartilhar aprendizado entre sessões
-══════════════════════════════════════════════════════════════ */
-
-function salvarSugestaoNoLog(sugestao, pergunta, categoria, suggestionId = null) {
-    if (!AppState.logSugestoes[categoria]) {
-        AppState.logSugestoes[categoria] = [];
-    }
-
-    // ── Idempotência: não salva a mesma sugestão mais de uma vez ──
-    const normText = normalizar(sugestao);
-    const jaSalva = AppState.logSugestoes[categoria].some(r =>
-        (suggestionId && r.suggestionId === suggestionId) ||
-        normalizar(r.texto) === normText
-    );
-    if (jaSalva) {
-        console.log("[Chatplay Assistant] ⚠️ Sugestão já no log — ignorando duplicata.");
-        return;
-    }
-
-    let registro = {
-        texto: sugestao,
-        suggestionId: suggestionId || null,
-        pergunta: pergunta || AppState.ultimaPergunta || "",
-        data: new Date().toISOString(),
-        id: Date.now()
-    };
-
-    AppState.logSugestoes[categoria].push(registro);
-
-    // Limita a 500 entradas por categoria
-    if (AppState.logSugestoes[categoria].length > 500) {
-        AppState.logSugestoes[categoria] = AppState.logSugestoes[categoria].slice(-500);
-    }
-
-    // _writeQueue garante serialização — sem Lost Update em append concorrente
-    storageUpdate(STORAGE_KEYS.LOG_SUGESTOES, () => AppState.logSugestoes, {});
-
-    // Atualiza contagem de sugestões (protegida pela fila)
-    AppState.estatisticas.totalSugestoes = (AppState.estatisticas.totalSugestoes || 0) + 1;
-    if (!AppState.estatisticas.categoriasMaisUsadas) AppState.estatisticas.categoriasMaisUsadas = {};
-    AppState.estatisticas.categoriasMaisUsadas[categoria] = (AppState.estatisticas.categoriasMaisUsadas[categoria] || 0) + 1;
-    storageUpdate(STORAGE_KEYS.STATS, () => AppState.estatisticas, {});
-
-    console.log(`[Chatplay Assistant] 📝 Sugestão salva no log | Categoria: ${categoria}`);
-}
-
-function aprenderComRespostasBoas(resposta, categoria) {
-    if (!AppState.templates[categoria]) {
-        AppState.templates[categoria] = [];
-    }
-
-    let similar = AppState.templates[categoria].some(t =>
-        calcularSimilaridadeSemantica(t, resposta) > 0.9
-    );
-
-    if (!similar && AppState.templates[categoria].length < 20) {
-        AppState.templates[categoria].push(resposta);
-        storageUpdate(STORAGE_KEYS.TEMPLATES, () => AppState.templates, {});
-        console.log(`[Chatplay Assistant] 📚 Novo template aprendido para ${categoria}`);
-    }
-}
-
-// Mapa de controle de rate: evita duplo clique registrar 2x no mesmo intervalo
-const _feedbackLock = new Map();
-
-function atualizarScoreResposta(resposta, categoria, foiBoa) {
-    const chave = `${categoria}:${normalizar(resposta).substring(0, 50)}`;
-    const lockKey = `${chave}:${foiBoa ? 'ok' : 'rej'}`;
-
-    // ── Debounce: ignora clique duplo dentro de 2 segundos ──
-    const agora = Date.now();
-    if (_feedbackLock.has(lockKey) && agora - _feedbackLock.get(lockKey) < 2000) {
-        console.log("[Chatplay Assistant] ⚠️ Feedback duplicado ignorado (debounce 2s).");
-        return;
-    }
-    _feedbackLock.set(lockKey, agora);
-
-    if (!AppState.scoresRespostas[chave]) {
-        AppState.scoresRespostas[chave] = {
-            acertos: 0,
-            erros: 0,
-            ultimoUso: Date.now()
-        };
-    }
-
-    if (foiBoa) {
-        AppState.scoresRespostas[chave].acertos++;
-        aprenderComRespostasBoas(resposta, categoria);
-    } else {
-        AppState.scoresRespostas[chave].erros++;
-    }
-
-    AppState.scoresRespostas[chave].ultimoUso = Date.now();
-
-    let scoresArray = Object.entries(AppState.scoresRespostas);
-    if (scoresArray.length > 500) {
-        scoresArray.sort((a, b) => b[1].ultimoUso - a[1].ultimoUso);
-        let novosScores = {};
-        scoresArray.slice(0, 500).forEach(([k, v]) => novosScores[k] = v);
-        AppState.scoresRespostas = novosScores;
-    }
-
-    // RMW crítico — _writeQueue previne Lost Update em escritas concorrentes
-    storageUpdate(STORAGE_KEYS.SCORES, () => AppState.scoresRespostas, {});
-}
-
-function getMelhoresRespostas(categoria, limite = 5) {
-    let candidatas = [];
-
-    // CORREÇÃO 4: Busca do logSugestoes ao invés de respostasUtilizadas
-    if (AppState.logSugestoes[categoria]) {
-        AppState.logSugestoes[categoria].forEach(registro => {
-            let resposta = registro.texto;
-            let chave = `${categoria}:${normalizar(resposta).substring(0, 50)}`;
-            let score = AppState.scoresRespostas[chave] || { acertos: 0, erros: 0 };
-            let taxaAcerto = score.acertos / (score.acertos + score.erros + 0.1);
-            candidatas.push({
-                resposta,
-                score: taxaAcerto * (score.acertos + 1)
-            });
-        });
-    }
-
-    getTemplatesParaCategoria(categoria).forEach(resposta => {
-        let chave = `${categoria}:${normalizar(resposta).substring(0, 50)}`;
-        let score = AppState.scoresRespostas[chave] || { acertos: 0, erros: 0 };
-        let taxaAcerto = score.acertos / (score.acertos + score.erros + 0.1);
-        candidatas.push({
-            resposta,
-            score: taxaAcerto * (score.acertos + 1)
-        });
-    });
-
-    candidatas.sort((a, b) => b.score - a.score);
-
-    let unicas = [];
-    let vistas = new Set();
-
-    for (let cand of candidatas) {
-        let normalizada = normalizar(cand.resposta);
-        if (!vistas.has(normalizada)) {
-            vistas.add(normalizada);
-            unicas.push(cand.resposta);
-        }
-        if (unicas.length >= limite) break;
-    }
-
-    return unicas;
-}
-
-function registrarRespostaDesaprovada(resposta, pergunta, categoria, contexto, suggestionId = null) {
-    console.log("[Chatplay Assistant] ❌ Registrando resposta desaprovada...");
-
-    // ── Idempotência: não registra duplicata da mesma resposta ──
-    const normResp = normalizar(resposta);
-    const jaSalva = AppState.sugestoesDesaprovadas.respostas.some(r =>
-        (suggestionId && r.suggestionId === suggestionId) ||
-        normalizar(r.resposta) === normResp
-    );
-    if (jaSalva) {
-        console.log("[Chatplay Assistant] ⚠️ Desaprovada já registrada — ignorando duplicata.");
-        return false;
-    }
-
-    let palavrasChave = extrairPalavrasChave(resposta);
-
-    let registro = {
-        id: Date.now(),
-        suggestionId: suggestionId || null,
-        resposta: resposta,
-        pergunta: pergunta,
-        categoria: categoria,
-        palavrasChave: palavrasChave,
-        contexto: contexto ? contexto.substring(0, 300) : "",
-        data: new Date().toISOString()
-    };
-
-    AppState.sugestoesDesaprovadas.respostas.push(registro);
-
-    if (!AppState.sugestoesDesaprovadas.categorias[categoria]) {
-        AppState.sugestoesDesaprovadas.categorias[categoria] = 0;
-    }
-    AppState.sugestoesDesaprovadas.categorias[categoria]++;
-
-    palavrasChave.forEach(palavra => {
-        let padraoExistente = AppState.sugestoesDesaprovadas.padroes.find(p => p.palavra === palavra);
-        if (padraoExistente) {
-            padraoExistente.contagem++;
-            padraoExistente.ultimaVez = Date.now();
-        } else {
-            AppState.sugestoesDesaprovadas.padroes.push({
-                palavra: palavra,
-                contagem: 1,
-                primeiraVez: Date.now(),
-                ultimaVez: Date.now(),
-                categorias: [categoria]
-            });
-        }
-    });
-
-    removerRespostaDosLogs(resposta, categoria);
-
-    atualizarScoreResposta(resposta, categoria, false);
-
-    if (AppState.sugestoesDesaprovadas.respostas.length > 500) {
-        AppState.sugestoesDesaprovadas.respostas = AppState.sugestoesDesaprovadas.respostas.slice(-500);
-    }
-
-    AppState.sugestoesDesaprovadas.padroes = AppState.sugestoesDesaprovadas.padroes
-        .filter(p => p.contagem > 1)
-        .sort((a, b) => b.contagem - a.contagem)
-        .slice(0, 100);
-
-    // RMW crítico — serializado pela _writeQueue
-    storageUpdate(STORAGE_KEYS.DESAPROVADAS, () => AppState.sugestoesDesaprovadas, { respostas: [], categorias: {}, padroes: [] });
-
-    AppState.estatisticas.totalDesaprovadas++;
-    storageUpdate(STORAGE_KEYS.STATS, () => AppState.estatisticas, {});
-
-    console.log(`[Chatplay Assistant] ✅ Resposta desaprovada registrada! Total: ${AppState.estatisticas.totalDesaprovadas}`);
-    return true;
-}
-
-function removerRespostaDosLogs(resposta, categoria) {
-    // Remove do histórico
-    AppState.historico = AppState.historico.map(item => {
-        if (item.respostas && Array.isArray(item.respostas)) {
-            item.respostas = item.respostas.filter(r => normalizar(r) !== normalizar(resposta));
-            if (item.respostas.length === 0) return null;
-        }
-        return item;
-    }).filter(item => item !== null);
-
-    // Remove do log de sugestões
-    if (AppState.logSugestoes[categoria]) {
-        AppState.logSugestoes[categoria] = AppState.logSugestoes[categoria].filter(
-            reg => normalizar(reg.texto) !== normalizar(resposta)
-        );
-        if (AppState.logSugestoes[categoria].length === 0) {
-            delete AppState.logSugestoes[categoria];
-        }
-    }
-
-    storageUpdate(STORAGE_KEYS.HISTORICO,     () => AppState.historico,     []);
-    storageUpdate(STORAGE_KEYS.LOG_SUGESTOES, () => AppState.logSugestoes, {});
-}
-
-function verificarRespostaDesaprovada(resposta) {
-    if (!AppState.preferencias.evitarDesaprovadas) return false;
-
-    let palavrasChave = extrairPalavrasChave(resposta);
-
-    for (let desaprovada of AppState.sugestoesDesaprovadas.respostas) {
-        let similaridade = calcularSimilaridadeSemantica(resposta, desaprovada.resposta);
-        if (similaridade > 0.8) return true;
-    }
-
-    for (let padrao of AppState.sugestoesDesaprovadas.padroes) {
-        if (palavrasChave.includes(padrao.palavra) && padrao.contagem > 3) return true;
-    }
-
-    return false;
-}
-
-function filtrarRespostasDesaprovadas(respostas) {
-    if (!AppState.preferencias.evitarDesaprovadas || respostas.length === 0) return respostas;
-
-    let respostasFiltradas = respostas.filter(r => !verificarRespostaDesaprovada(r));
-
-    if (respostasFiltradas.length < respostas.length) {
-        console.log(`[Chatplay Assistant] 🚫 ${respostas.length - respostasFiltradas.length} respostas removidas por serem desaprovadas`);
-    }
-
-    return respostasFiltradas;
-}
-
-function calcularTaxaAcertoMedia() {
-    let total = 0;
-    let soma = 0;
-
-    Object.values(AppState.scoresRespostas).forEach(score => {
-        if (score.acertos + score.erros > 0) {
-            soma += (score.acertos / (score.acertos + score.erros)) * 100;
-            total++;
-        }
-    });
-
-    return total > 0 ? soma / total : 0;
-}
-
-
-/** @namespace LearningEngine — ponto de acesso público do módulo */
-const LearningEngine = {
-    salvarSugestaoNoLog,
-    aprenderComRespostasBoas,
-    atualizarScoreResposta,
-    getMelhoresRespostas,
-    registrarRespostaDesaprovada,
-    removerRespostaDosLogs,
-    verificarRespostaDesaprovada,
-    filtrarRespostasDesaprovadas,
-    calcularTaxaAcertoMedia,
-};
-
 /* ══════════════════════════════════════════════════════════════
    [M7] MODULE: HistoryManager
-   Histórico de conversas tratadas e exclusão de respostas desaprovadas.
-   Migração futura: Migrar para IndexedDB ou backend REST para persistência cross-session
+   Histórico de perguntas/respostas com busca por similaridade.
 ══════════════════════════════════════════════════════════════ */
 
 function salvarNoHistorico(pergunta, respostas, contexto) {
     let registro = {
-        id: Date.now(),
+        id:        Date.now(),
         pergunta,
-        tokens: tokenizar(pergunta),
+        tokens:    tokenizar(pergunta),
         categoria: classificarIntencao(pergunta),
-        contexto: contexto.substring(0, 500),
+        contexto:  contexto.substring(0, 500),
         respostas,
-        data: new Date().toISOString()
+        data:      new Date().toISOString(),
     };
 
     AppState.historico.push(registro);
-    console.log(`[Chatplay Assistant] 💾 SALVO NO HISTÓRICO - Pergunta: "${pergunta.substring(0,70)}..."`);
+    console.log(`[Chatplay Assistant] 💾 SALVO NO HISTÓRICO - Pergunta: "${pergunta.substring(0, 70)}..."`);
 
     if (AppState.historico.length > CONFIG.MAX_HISTORY_SIZE) {
         AppState.historico = AppState.historico.slice(-CONFIG.MAX_HISTORY_SIZE);
     }
 
-    // _writeQueue serializa o append — sem Lost Update em conversas simultâneas
     storageUpdate(STORAGE_KEYS.HISTORICO, () => AppState.historico, []);
 }
 
 function buscarNoHistorico(pergunta) {
     console.log("[Chatplay Assistant] 🔍 Buscando no histórico...");
 
-    let melhorItem = null;
+    let melhorItem  = null;
     let melhorScore = 0;
 
     for (let item of AppState.historico) {
         let score = calcularSimilaridadeSemantica(pergunta, item.pergunta);
-        if (score > melhorScore) {
-            melhorScore = score;
-            melhorItem = item;
-        }
+        if (score > melhorScore) { melhorScore = score; melhorItem = item; }
     }
 
     if (melhorScore >= CONFIG.SIMILARITY_THRESHOLD) {
-        console.log(`[Chatplay Assistant] 📚 USOU HISTÓRICO - Similaridade: ${(melhorScore*100).toFixed(1)}%`);
+        console.log(`[Chatplay Assistant] 📚 USOU HISTÓRICO - Similaridade: ${(melhorScore * 100).toFixed(1)}%`);
         AppState.estatisticas.totalEconomiaAPI++;
         storageUpdate(STORAGE_KEYS.STATS, () => AppState.estatisticas, {});
         return { tipo: "historico", item: melhorItem };
@@ -1686,11 +346,8 @@ function excluirRespostaDesaprovada(id) {
     const padroesMap = new Map();
     AppState.sugestoesDesaprovadas.respostas.forEach(item => {
         item.palavrasChave.forEach(palavra => {
-            if (padroesMap.has(palavra)) {
-                padroesMap.get(palavra).contagem++;
-            } else {
-                padroesMap.set(palavra, { palavra, contagem: 1 });
-            }
+            if (padroesMap.has(palavra)) padroesMap.get(palavra).contagem++;
+            else padroesMap.set(palavra, { palavra, contagem: 1 });
         });
     });
 
@@ -1703,28 +360,18 @@ function excluirRespostaDesaprovada(id) {
     mostrarNotificacao("✅ Resposta desaprovada excluída!");
 }
 
-
-/** @namespace HistoryManager — ponto de acesso público do módulo */
-const HistoryManager = {
-    salvarNoHistorico,
-    buscarNoHistorico,
-    excluirItemHistorico,
-    excluirRespostaDesaprovada,
-};
-
 /* ══════════════════════════════════════════════════════════════
    [M8] MODULE: ChatEngine
    Gerenciamento de mensagens do chat interno do assistente.
-   Migração futura: Transformar em componente React/Web Component na extensão
 ══════════════════════════════════════════════════════════════ */
 
 function adicionarMensagemAoChat(role, conteudo, tipo = "texto", meta = null) {
     let mensagem = {
-        role: role,
-        content: conteudo,
-        tipo: tipo,
+        role,
+        content:   conteudo,
+        tipo,
         timestamp: Date.now(),
-        meta: meta || undefined
+        meta:      meta || undefined,
     };
 
     AppState.chatMessages.push(mensagem);
@@ -1734,7 +381,6 @@ function adicionarMensagemAoChat(role, conteudo, tipo = "texto", meta = null) {
     }
 
     storageUpdate(STORAGE_KEYS.CHAT_MSGS, () => AppState.chatMessages, []);
-
     renderizarTodasMensagens();
 }
 
@@ -1745,9 +391,9 @@ async function enviarMensagemChat(mensagem) {
     mostrarDigitacao("digitando");
 
     try {
-        const baseCoren = await carregarConhecimentoCoren();
+        await carregarConhecimentoCoren();
         await carregarConhecimentoChat();
-        let resposta = await gerarRespostaChat(mensagem, baseCoren);
+        let resposta = await gerarRespostaChat(mensagem);
         removerDigitacao();
         adicionarMensagemAoChat("assistant", resposta);
     } catch (error) {
@@ -1757,12 +403,6 @@ async function enviarMensagemChat(mensagem) {
     }
 }
 
-
-/** @namespace ChatEngine — ponto de acesso público do módulo */
-const ChatEngine = {
-    adicionarMensagemAoChat,
-    enviarMensagemChat,
-};
 
 /* ══════════════════════════════════════════════════════════════
    [M9] MODULE: UI
@@ -2984,7 +1624,6 @@ function criarPainelFixo() {
     renderizarTodasMensagens();
 }
 
-function mostrarOpcoesLimpeza() { return; }
 
 
 function criarPainelProfissional() {
@@ -3447,6 +2086,7 @@ const UI = {
     criarPainelFixo,
     criarPainelProfissional,
 };
+
 
 /* ══════════════════════════════════════════════════════════════
    [M0] Bootstrap — Atalhos e Inicialização

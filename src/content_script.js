@@ -306,7 +306,7 @@ function _buildLoginWindow() {
     return el;
 }
 
-/** Executa o login a partir da janela flutuante. */
+/** Executa o login a partir da janela flutuante, roteando pelo background.js. */
 async function _doFloatLogin(el) {
     const credVal   = el.querySelector('#cpa-fl-credential').value.trim();
     const password  = el.querySelector('#cpa-fl-password').value;
@@ -327,17 +327,17 @@ async function _doFloatLogin(el) {
             ? { email: credVal, password }
             : { username: credVal, password };
 
-        const res = await fetch(`${_floatBackendUrl}/api/auth/login`, {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body:    JSON.stringify(loginBody),
+        // Roteado pelo background.js — centraliza autenticação em um único lugar
+        const data = await new Promise((resolve, reject) => {
+            chrome.runtime.sendMessage(
+                { type: 'BACKEND_REQUEST', payload: { path: '/api/auth/login', method: 'POST', body: loginBody } },
+                (response) => {
+                    if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+                    if (!response?.ok) return reject(new Error(response?.error || `HTTP ${response?.status}`));
+                    resolve(response.data);
+                }
+            );
         });
-
-        const data = await res.json().catch((parseErr) => {
-            console.warn('[AssistentePlayExt] Falha ao parsear resposta de login:', parseErr);
-            return {};
-        });
-        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
         // Salvar token no storage
         const toSave = { [_FL_STORAGE_TOKEN]: data.token };
