@@ -13,7 +13,8 @@
 'use strict';
 
 import { AppState } from './state.js';
-import { storageUpdate, STORAGE_KEYS } from './storage.js';
+import { storageUpdate } from './storage.js';
+import { STORAGE_KEYS } from './config.js';
 import { normalizar, extrairPalavrasChave, calcularSimilaridadeSemantica } from './text_analysis.js';
 
 /**
