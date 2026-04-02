@@ -26,7 +26,7 @@ import {
     carregarAppState, garantirEstruturaEstatisticas, _inicializarOnChanged,
 } from './modules/storage.js';
 import {
-    normalizar, tokenizar, classificarIntencao, calcularSimilaridadeSemantica,
+    normalizar, tokenizar, classificarIntencao, classificarIntencaoComConfianca, calcularSimilaridadeSemantica,
 } from './modules/text_analysis.js';
 import { capturarMensagens, detectarPergunta } from './modules/chat_capture.js';
 import { carregarConhecimentoCoren, carregarConhecimentoChat } from './modules/knowledge_base.js';
@@ -146,14 +146,15 @@ async function gerarRespostasIA(contexto, pergunta) {
         }
 
         console.log("[Chatplay Assistant] 🌐 Gerando sugestões via backend...");
-        const categoria = classificarIntencao(pergunta);
+        const { categoria, confianca } = classificarIntencaoComConfianca(pergunta);
 
         const result = await BackendAPI.generateSuggestions({
-            context:       contexto,
-            question:      pergunta,
-            category:      categoria,
-            topExamples:   getMelhoresRespostas(categoria, 3),
-            avoidPatterns: AppState.sugestoesDesaprovadas.padroes.slice(0, 5).map(p => p.palavra),
+            context:            contexto,
+            question:           pergunta,
+            category:           categoria,
+            categoryConfidence: confianca,
+            topExamples:        getMelhoresRespostas(categoria, 3),
+            avoidPatterns:      AppState.sugestoesDesaprovadas.padroes.slice(0, 5).map(p => p.palavra),
         });
 
         const respostas = result.suggestions.map(s => s.text || s);
@@ -161,9 +162,11 @@ async function gerarRespostasIA(contexto, pergunta) {
         AppState._lastSuggestionIds = result.suggestions.map(s => s.id).filter(Boolean);
 
         BackendAPI.logEvent('suggestion.generated', {
-            category:  categoria,
-            count:     respostas.length,
-            latencyMs: result.latencyMs,
+            category:           result.category || categoria,
+            categoryConfidence: result.confidence ?? confianca,
+            lowConfidence:      result.lowConfidence ?? false,
+            count:              respostas.length,
+            latencyMs:          result.latencyMs,
         });
 
         return respostas;
@@ -243,7 +246,7 @@ async function gerarSugestoesPainel() {
         const contexto = mensagens.map(m => `${m.autor}:\n${m.texto}`).join("\n\n")
             + `\n\nCLIENTE (MENSAGEM PRINCIPAL):\n${pergunta}`;
 
-        const categoria = classificarIntencao(pergunta);
+        const { categoria } = classificarIntencaoComConfianca(pergunta);
 
         let encontrado = buscarNoHistorico(pergunta);
         let respostas;

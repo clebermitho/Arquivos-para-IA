@@ -105,10 +105,12 @@ export const BackendAPI = {
     },
 
     /** Gera sugestões via backend (OpenAI permanece no servidor). */
-    async generateSuggestions({ context, question, category, topExamples = [], avoidPatterns = [] }) {
+    async generateSuggestions({ context, question, category, categoryConfidence = null, topExamples = [], avoidPatterns = [] }) {
+        const body = { context, question, category, topExamples, avoidPatterns };
+        if (categoryConfidence !== null) body.categoryConfidence = categoryConfidence;
         return this.request('/api/ai/suggestions', {
             method: 'POST',
-            body: JSON.stringify({ context, question, category, topExamples, avoidPatterns }),
+            body: JSON.stringify(body),
         });
     },
 
@@ -118,6 +120,33 @@ export const BackendAPI = {
             method: 'POST',
             body: JSON.stringify({ message, history, context }),
         });
+    },
+
+    /**
+     * Busca contexto relevante da base de conhecimento sob demanda (RAG).
+     *
+     * Endpoint alvo: GET /v1/knowledge/context
+     * Evita carregar o JSON completo no client — retorna apenas os chunks relevantes.
+     *
+     * ⚠️  MIGRAÇÃO: Este método substituirá carregarConhecimentoCoren/Chat
+     * quando o backend implementar o endpoint. Até lá, retorna null e o
+     * comportamento atual é mantido.
+     *
+     * @param {string} query - Texto para busca semântica
+     * @param {{ category?: string, limit?: number }} options
+     * @returns {Promise<{ chunks: Array<{ id: string, text: string, source: string, relevance: number }> } | null>}
+     */
+    async getKnowledgeContext(query, { category = null, limit = 5 } = {}) {
+        try {
+            const params = new URLSearchParams({ query, limit: String(limit) });
+            if (category) params.set('category', category);
+            return await this.request(`/v1/knowledge/context?${params}`);
+        } catch (err) {
+            // Endpoint ainda não implementado no backend — falha silenciosa esperada
+            // durante período de migração. Remover este catch após implementação.
+            if (err.status === 404) return null;
+            throw err;
+        }
     },
 
     /** Registra evento de uso (fire-and-forget). */
