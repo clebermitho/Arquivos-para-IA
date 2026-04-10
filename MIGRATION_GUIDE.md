@@ -21,7 +21,7 @@ src/
     ├── storage.js         ← M1: Adapters, _writeQueue, storageGet/Set/Update, carregarAppState
     ├── text_analysis.js   ← M2: normalizar, tokenizar, classificarIntencao, similaridade
     ├── chat_capture.js    ← M3 (leitura): capturarMensagens, descobrirAutor, detectarPergunta
-    ├── knowledge_base.js  ← M4: carregarConhecimentoCoren/Chat (cache em memória)
+    ├── knowledge_base.js  ← M4: carregarBaseConhecimento (cache em memória + fallback de transição)
     ├── backend_api.js     ← BackendAPI (roteado via background.js) + openAIBridge (dev)
     └── learning_engine.js ← M6: scores, templates, feedback, filtros de desaprovadas
 ```

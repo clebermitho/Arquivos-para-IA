@@ -29,7 +29,7 @@ import {
     normalizar, tokenizar, classificarIntencao, calcularSimilaridadeSemantica,
 } from './modules/text_analysis.js';
 import { capturarMensagens, detectarPergunta } from './modules/chat_capture.js';
-import { carregarConhecimentoCoren, carregarConhecimentoChat } from './modules/knowledge_base.js';
+import { carregarBaseConhecimento } from './modules/knowledge_base.js';
 import { BackendAPI } from './modules/backend_api.js';
 import {
     salvarSugestaoNoLog, registrarRespostaDesaprovada,
@@ -391,8 +391,7 @@ async function enviarMensagemChat(mensagem) {
     mostrarDigitacao("digitando");
 
     try {
-        await carregarConhecimentoCoren();
-        await carregarConhecimentoChat();
+        await carregarBaseConhecimento();
         let resposta = await gerarRespostaChat(mensagem);
         removerDigitacao();
         adicionarMensagemAoChat("assistant", resposta);
