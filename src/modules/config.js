@@ -21,7 +21,7 @@ export const CONFIG = {
     SIMILARITY_THRESHOLD: 0.65,
     MAX_MESSAGES_TO_CAPTURE: 12,
     KNOWLEDGE_BASE_URL: "https://raw.githubusercontent.com/clebermitho/knowledge-base/main/base-conhecimento.json",
-    // Compatibilidade de transição (fallback apenas se a base canonica falhar)
+    // Compatibilidade de transição (fallback apenas se a base canônica falhar)
     KNOWLEDGE_BASE_FALLBACK_URLS: [
         "https://raw.githubusercontent.com/clebermitho/knowledge-base/main/base_coren.json",
         "https://raw.githubusercontent.com/clebermitho/knowledge-base/main/programa%C3%A7%C3%A3o%20ia.json",
