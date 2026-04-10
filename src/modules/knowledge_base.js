@@ -45,7 +45,7 @@ async function carregarComFallback(urls) {
 export async function carregarBaseConhecimento() {
     if (_cacheBaseConhecimento) return _cacheBaseConhecimento;
 
-    const urls = [CONFIG.KNOWLEDGE_BASE_URL, ...(CONFIG.KNOWLEDGE_BASE_FALLBACK_URLS || [])].filter(Boolean);
+    const urls = [CONFIG.KNOWLEDGE_BASE_URL, ...(CONFIG.KNOWLEDGE_BASE_FALLBACK_URLS || [])];
     try {
         console.log("[Chatplay Assistant] 📚 Carregando base de conhecimento unificada...");
         _cacheBaseConhecimento = await carregarComFallback(urls);
